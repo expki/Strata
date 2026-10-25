@@ -136,6 +136,7 @@ namespace strata::kernels { void res_patch(int* p0, int const* p1, int p2, void*
 namespace strata::kernels { void wait_copy_i32_from_mapped(unsigned int const* p0, unsigned int p1, int* p2, int const* p3, long long p4, void* p5) { strata::metal_engine::missing("strata::kernels::wait_copy_i32_from_mapped"); } }
 namespace strata::kernels { void wait_flag_ge_stamped(unsigned int const* p0, unsigned int p1, unsigned long long* p2, unsigned long long* p3, void* p4) { strata::metal_engine::missing("strata::kernels::wait_flag_ge_stamped"); } }
 namespace strata::kernels { void wait_handoff(unsigned int const* p0, unsigned int p1, unsigned int* p2, unsigned long long p3, void* p4) { strata::metal_engine::missing("strata::kernels::wait_handoff"); } }
+namespace strata::kernels { void raise_flag(unsigned int* p0, unsigned int p1, void* p2) { strata::metal_engine::missing("strata::kernels::raise_flag"); } }
 namespace strata::prefill { bool f16_range_read(float& p0, unsigned long long& p1, bool p2) {  return false; } }
 namespace strata::prefill { bool gemm_f16_range_read(float* p0, unsigned long long* p1, bool p2) {  return false; } }
 namespace strata::prefill { void gr_norm(float const* p0, float const* p1, float p2, float* p3, unsigned short* p4, long long p5, void* p6, unsigned short* p7, bool p8) { strata::metal_engine::missing("strata::prefill::gr_norm"); } }

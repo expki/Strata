@@ -1,0 +1,6 @@
+{
+  global:
+    strata_xtier_*;
+  local:
+    *;
+};

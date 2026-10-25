@@ -2,6 +2,7 @@
 #include "strata/core/peer_experts.hpp"
 
 #include "strata/core/device.hpp"   // primary_device() (STRATA_PRIMARY_DEVICE)
+#include "strata/core/peer_adapt.hpp"
 #include "strata/kernels/cpu/expert_layout.hpp"
 #include "strata/kernels/cpu/hadamard.hpp"
 #include "strata/kernels/elementwise.hpp"
@@ -14,6 +15,7 @@
 #include <cstdio>
 #include <cstring>
 #include <cstdlib>
+#include <optional>
 #include <stdexcept>
 #include <vector>
 
@@ -28,14 +30,8 @@ namespace {
 constexpr int64_t H = strata::kernels::cpu::H;
 constexpr int64_t CAP = strata::kernels::cpu::MAXT * 10;   // entries per layer: MAXT tokens x top-10
 
-struct Meta {                           // one block, uploaded with one copy per layer
-    unsigned long long ptr[CAP];
-    int32_t start[CAP + 1];
-    int32_t dst[CAP];
-    int32_t tok[CAP];
-    int32_t count[4];                   // [0] groups, [1] entries
-    int32_t out_row[CAP];               // multi-GPU: compact row -> entry row in the host `out`
-};
+using Meta = strata_xtier_meta;         // one block, uploaded with one copy per layer (the AMD tier library takes the same)
+static_assert(STRATA_XTIER_CAP == CAP, "the AMD tier library's plan holds a layer's entries");
 
 /// Switches the calling thread to `dev` and back.  The engine's own thread lives on device 0.
 struct On {
@@ -94,6 +90,10 @@ bool ck(cudaError_t e, const char* what, std::string& err) {
 PeerExperts::~PeerExperts() { close(); }
 
 void PeerExperts::close() {
+    xdev_.close();   // the library waits for the AMD card's streams and frees it, unless a wait for the card timed out
+    xslot_.clear();
+    xbytes_ = 0;
+    free_.clear();
     if (device_ < 0) return;
     {
         On on(device_);
@@ -241,16 +241,111 @@ bool PeerExperts::open(int device, const std::vector<std::pair<int32_t, int32_t>
     return true;
 }
 
+bool PeerExperts::open_foreign(const xtier::HipCard& card, const std::vector<std::pair<int32_t, int32_t>>& ranked,
+                               const std::function<bool(int32_t, int32_t)>& held, ExpertSource& src, int64_t n_layers,
+                               int64_t n_expert, int reserve_mib, int64_t max_slots, std::string& err) {
+    close();
+    const auto& lay = strata::kernels::cpu::expert_layout();
+    if (!lay.native) { err = "peer experts: only native packs are supported"; return false; }
+    for (const auto& f : lay.fmt) {   // what the library's decode cannot express would give wrong rows, not an error
+        if (f.tail_off) { err = "peer experts: the AMD tier is not for NVFP4 experts yet"; return false; }
+        if (f.had_gu || f.had_d) { err = "peer experts: the AMD tier is not for a Hadamard-folded (APR) pack yet"; return false; }
+        if (f.n_embd > STRATA_XTIER_MAX_EMBD || f.n_ff > STRATA_XTIER_MAX_FF) {
+            err = "peer experts: experts " + std::to_string(f.n_embd) + " wide with " + std::to_string(f.n_ff) +
+                  " hidden rows are more than the AMD tier library takes (" + std::to_string(STRATA_XTIER_MAX_EMBD) + " and " +
+                  std::to_string(STRATA_XTIER_MAX_FF) + ")";
+            return false;
+        }
+    }
+    // main set HIP_VISIBLE_DEVICES already when it was unset (xtier::claim_hip_card), and a set value, even an empty one, is honoured
+    if (xtier::load(err) == nullptr) { err = "peer experts: " + err; return false; }
+    const char* tv = std::getenv("STRATA_XTIER_TIMING");
+    xtiming_ = tv != nullptr && std::atoi(tv) != 0;
+    if (!xdev_.open(card.open, err)) {
+        const char* hv = std::getenv("HIP_VISIBLE_DEVICES");
+        const std::string hv_text = card.engine_set ? std::to_string(card.n) + " set by the engine"
+                                    : hv == nullptr ? std::string("unset") : hv[0] == '\0' ? std::string("\"\"") : std::string(hv);
+        const char* cv = std::getenv("CUDA_VISIBLE_DEVICES");
+        err = "peer experts: AMD card hip:" + std::to_string(card.n) + ": " + err + " (HIP_VISIBLE_DEVICES=" + hv_text +
+              ", CUDA_VISIBLE_DEVICES=" + (cv != nullptr ? cv : "unset") + ")";
+        return false;
+    }
+    n_layers_ = n_layers;
+    n_expert_ = n_expert;
+    src_ = &src;
+    res_.assign((size_t) (n_layers * n_expert), kNotResident);
+    // the pairs no CUDA card holds, in rank order, as many as fit (the library's buffers are already taken)
+    uint64_t free_b = 0, total_b = 0;
+    if (!xdev_.mem_info(free_b, total_b, err)) { err = "peer experts: " + err; close(); return false; }
+    const uint64_t reserve = (uint64_t) std::max(reserve_mib, 128) << 20;
+    const uint64_t budget = free_b > reserve ? free_b - reserve : 0;
+    std::vector<std::pair<int32_t, int32_t>> pick;
+    std::vector<uint64_t> sizes;
+    uint64_t used = 0;
+    for (const auto& pr : ranked) {
+        if (held(pr.first, pr.second)) continue;
+        const uint64_t b = lay.blob_bytes(pr.first);
+        const uint64_t b256 = (b + 255) / 256 * 256;
+        if (used + b256 > budget) break;
+        if (max_slots > 0 && (int64_t) pick.size() >= max_slots) break;
+        used += b256;
+        pick.push_back(pr);
+        sizes.push_back(b);
+    }
+    if (pick.empty()) { err = "peer experts: no room or no expert left for the peer"; close(); return false; }
+    if (!xdev_.arena(sizes, xslot_, err)) { err = "peer experts: " + err; close(); return false; }
+    xbytes_ = used;
+    constexpr size_t kAhead = 256;   // mapped reads: advise the next kAhead pairs so their reads overlap
+    const bool advise = src.advise_pairs(pick.data(), (int64_t) std::min(kAhead, pick.size()));
+    for (size_t i = 0; i < pick.size(); ++i) {
+        const auto& pr = pick[i];
+        if (advise && i + kAhead < pick.size()) (void) src.advise_pairs(&pick[i + kAhead], 1);
+        const uint8_t* b = src.blob(pr.first, pr.second);
+        if (b == nullptr || !xdev_.fill((int64_t) i, b, sizes[i], err)) {
+            err = "peer experts: fill failed: " + err;
+            close();
+            return false;
+        }
+        res_[(size_t) (pr.first * n_expert + pr.second)] = (int32_t) i;
+    }
+    if (!xdev_.refill_record(err) || xdev_.refill_done(true, &err) != 1) { err = "peer experts: fill: " + err; close(); return false; }
+    std::vector<uint8_t> back((size_t) sizes[0]);   // slot 0 read back, as the CUDA tier checks its first slot
+    if (!xdev_.read(0, back.data(), sizes[0], err)) { err = "peer experts: " + err; close(); return false; }
+    const uint8_t* b0 = src.blob(pick[0].first, pick[0].second);
+    if (b0 == nullptr || std::memcmp(back.data(), b0, (size_t) sizes[0]) != 0) {
+        err = "peer experts: slot 0 does not hold its expert after the fill";
+        close();
+        return false;
+    }
+    resident_ = (int64_t) pick.size();
+    return true;
+}
+
 bool PeerExperts::launch(int64_t layer, const float* x, const int32_t* ids, int64_t n_tok, int64_t k,
                          const int32_t* kind, std::string& err, float* out) {
     static const bool direct_env = [] { const char* v = std::getenv("STRATA_PEER_DIRECT"); return v == nullptr || std::atoi(v) != 0; }();
-    const bool direct = direct_env && out != nullptr;
+    const bool direct = direct_env && out != nullptr && !foreign();   // an AMD card does not write into the host rows
+    if (foreign() && launched_rows_ > 0) {   // a failed window left its rows untaken, and the library holds one decode at a time
+        const float* rows = nullptr;
+        std::string e;
+        if (!xdev_.decode_wait(&rows, e)) {   // it cannot be drained: no expert is planned for the tier from here on
+            std::fprintf(stderr, "strata generate: the AMD tier stopped answering and is turned off\n");
+            res_.assign(res_.size(), kNotResident);
+            pending_.clear();
+            free_.clear();
+            launched_rows_ = 0;
+            err = "peer experts: " + e;
+            return false;
+        }
+    }
     launched_direct_ = false;
     launched_rows_ = 0;
     row_of_.clear();
+    const auto t0 = xtiming_ ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    if (xtiming_) ++xt_calls_;
     const int64_t n = n_tok * k;
     if (n > CAP) { err = "peer experts: window too large"; return false; }
-    Meta& m = *(Meta*) h_meta_;
+    Meta& m = foreign() ? xmeta_ : *(Meta*) h_meta_;
     int groups = 0, rows = 0;
     // distinct experts in routing order; each one's entries become compact rows
     for (int64_t i = 0; i < n; ++i) {
@@ -261,7 +356,7 @@ bool PeerExperts::launch(int64_t layer, const float* x, const int32_t* ids, int6
         if (seen) continue;
         const int32_t slot = res_[(size_t) (layer * n_expert_ + ids[i])];
         if (slot < 0) { err = "peer experts: an entry was planned for the peer but is not resident"; return false; }
-        m.ptr[groups] = (unsigned long long) cache_.device_slot(slot);
+        m.ptr[groups] = foreign() ? xslot_[(size_t) slot] : (unsigned long long) cache_.device_slot(slot);
         m.start[groups] = rows;
         for (int64_t j = i; j < n; ++j)
             if (kind[j] == 2 && ids[j] == ids[i]) {
@@ -280,6 +375,25 @@ bool PeerExperts::launch(int64_t layer, const float* x, const int32_t* ids, int6
     m.count[1] = rows;
     entries_ += rows;
     launched_rows_ = rows;
+    const auto& lay = strata::kernels::cpu::expert_layout();
+    if (foreign()) {   // the library copies x and the plan before it returns
+        const auto& f = lay.fmt[(size_t) layer];
+        const strata_xtier_fmt xf = {f.gu_type, f.d_type, f.n_embd, f.n_ff, f.up_off, f.down_off, f.bytes};
+        const auto t1 = xtiming_ ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+        if (xdev_.decode(xf, x, n_tok, m, err)) {
+            if (xtiming_) {
+                xt_end_ = std::chrono::steady_clock::now();
+                xt_[0] += std::chrono::duration<double, std::milli>(xt_end_ - t0).count();
+                xt_[1] += std::chrono::duration<double, std::milli>(xt_end_ - t1).count();
+                xt_rows_ += rows;
+                xt_groups_ += groups;
+            }
+            return true;
+        }
+        err = "peer experts: " + err;
+        launched_rows_ = 0;
+        return false;
+    }
     // direct: x is the verifier's pinned (portable) doorbell row block - copied from where it is
     if (!direct) std::memcpy(h_x_, x, (size_t) (n_tok * H) * sizeof(float));
     On on(device_);
@@ -288,7 +402,6 @@ bool PeerExperts::launch(int64_t layer, const float* x, const int32_t* ids, int6
         !ck(cudaMemcpyAsync(d_meta_, h_meta_, sizeof(Meta), cudaMemcpyHostToDevice, s), "plan", err))
         return false;
     Meta* dm = (Meta*) d_meta_;
-    const auto& lay = strata::kernels::cpu::expert_layout();
     if (lay.native) {
         const auto& f = lay.fmt[(size_t) layer];
         // APR: Hadamard-folded gate/up take H (s * x); d_x_ is this device's private copy, rotated in place
@@ -316,7 +429,10 @@ bool PeerExperts::launch(int64_t layer, const float* x, const int32_t* ids, int6
 bool PeerExperts::finish(float* out, std::string& err) {
     if (launched_rows_ == 0) return true;
     const auto t0 = std::chrono::steady_clock::now();
-    {
+    const float* rows = h_out_;
+    if (foreign()) {   // the library spins on its own decode stream
+        if (!xdev_.decode_wait(&rows, err)) { err = "peer experts: " + err; return false; }
+    } else {
         On on(device_);
         // spin on the stream (a blocking sync would sleep the pool thread and wake it late)
         cudaError_t e;
@@ -324,68 +440,109 @@ bool PeerExperts::finish(float* out, std::string& err) {
         }
         if (!ck(e, "finish", err)) return false;
     }
-    ms_wait += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+    const auto t1 = std::chrono::steady_clock::now();
+    ms_wait += std::chrono::duration<double, std::milli>(t1 - t0).count();
     if (launched_direct_) { launched_rows_ = 0; return true; }
     for (size_t r = 0; r < row_of_.size(); ++r)
-        std::memcpy(out + (size_t) row_of_[r] * H, h_out_ + r * H, (size_t) H * sizeof(float));
+        std::memcpy(out + (size_t) row_of_[r] * H, rows + r * H, (size_t) H * sizeof(float));
     launched_rows_ = 0;
+    if (xtiming_) {
+        const auto t2 = std::chrono::steady_clock::now();
+        xt_[2] += std::chrono::duration<double, std::milli>(t0 - xt_end_).count();
+        xt_[3] += std::chrono::duration<double, std::milli>(t1 - t0).count();
+        xt_[4] += std::chrono::duration<double, std::milli>(t2 - t1).count();
+    }
     return true;
+}
+
+void PeerExperts::timing_start() {
+    if (!xtiming_) return;
+    std::fill(std::begin(xt_), std::end(xt_), 0.0);
+    xt_calls_ = xt_rows_ = xt_groups_ = 0;
+    double card[3] = {};
+    (void) xdev_.timing(card);   // the card's sums start over too
+}
+
+void PeerExperts::timing_print() {
+    if (!xtiming_ || xt_calls_ == 0) return;
+    double card[3] = {};
+    const int n = xdev_.timing(card);
+    const double c = (double) xt_calls_;
+    std::fprintf(stderr, "strata decode AMD tier timing: %lld layer-windows, %.2f entries in %.2f experts each; ms per layer-window: "
+                         "launch %.3f (of it the library's decode call %.3f), the pool between launch and finish %.3f, finish "
+                         "wait %.3f, copy out %.3f; the card (%d decodes timed) copies in %.3f, kernels %.3f, copy out %.3f\n",
+                 (long long) xt_calls_, (double) xt_rows_ / c, (double) xt_groups_ / c, xt_[0] / c, xt_[1] / c, xt_[2] / c,
+                 xt_[3] / c, xt_[4] / c, n, card[0] / c, card[1] / c, card[2] / c);
+    timing_start();
 }
 
 bool PeerExperts::adapt(const float* usage, const int32_t* res0, int max_swaps, std::string& err) {
     if (!pending_.empty() || max_swaps <= 0) return true;
     const auto& lay = strata::kernels::cpu::expert_layout();
-    struct Swap { float gain; int32_t layer, in, out; };
-    std::vector<Swap> swaps;
-    std::vector<std::pair<float, int32_t>> cand, vict;
-    for (int64_t l = 0; l < n_layers_; ++l) {
-        cand.clear();
-        vict.clear();
-        const float* u = usage + l * n_expert_;
-        const int32_t* r0 = res0 + l * n_expert_;
-        const int32_t* r1 = res_.data() + l * n_expert_;
-        for (int32_t e = 0; e < (int32_t) n_expert_; ++e) {
-            if (r1[e] >= 0) vict.emplace_back(u[e], e);
-            else if (r0[e] < 0 && u[e] >= 2.0f) cand.emplace_back(u[e], e);
-        }
-        if (cand.empty() || vict.empty()) continue;
-        std::sort(cand.begin(), cand.end(), [](auto& a, auto& b) { return a.first > b.first; });
-        const size_t nc = std::min(cand.size(), vict.size());
-        std::partial_sort(vict.begin(), vict.begin() + (ptrdiff_t) nc, vict.end(),
-                          [](auto& a, auto& b) { return a.first < b.first; });
-        for (size_t i = 0; i < nc; ++i) {
-            if (cand[i].first < vict[i].first + 1.5f) break;
-            swaps.push_back({cand[i].first - vict[i].first, (int32_t) l, cand[i].second, vict[i].second});
-        }
-    }
+    const std::vector<PeerSwap> swaps = peer_adapt_choose(usage, res0, res_.data(), free_, n_layers_, n_expert_, max_swaps);
     if (swaps.empty()) return true;
-    std::sort(swaps.begin(), swaps.end(), [](const Swap& a, const Swap& b) { return a.gain > b.gain; });
-    if ((int) swaps.size() > max_swaps) swaps.resize((size_t) max_swaps);
-    On on(device_);
-    for (const Swap& s : swaps) {
-        const size_t in = (size_t) (s.layer * n_expert_ + s.in), out = (size_t) (s.layer * n_expert_ + s.out);
-        const int32_t slot = res_[out];
+    std::optional<On> on;
+    if (!foreign()) on.emplace(device_);
+    for (const PeerSwap& s : swaps) {
+        const size_t in = (size_t) (s.layer * n_expert_ + s.in);
+        std::vector<int32_t>* fr = s.out < 0 ? &free_[(size_t) s.layer] : nullptr;
+        int32_t* victim = fr != nullptr ? nullptr : &res_[(size_t) (s.layer * n_expert_ + s.out)];
+        const int32_t slot = fr != nullptr ? fr->back() : *victim;
         const uint8_t* b = src_->blob(s.layer, s.in);
         if (slot < 0 || b == nullptr) continue;
-        if (!ck(cudaMemcpyAsync(cache_.device_slot(slot), b, (size_t) lay.blob_bytes(s.layer), cudaMemcpyHostToDevice,
-                                refill_), "refill", err))
+        if (foreign()) {
+            if (!xdev_.fill(slot, b, lay.blob_bytes(s.layer), err)) { err = "peer experts: refill: " + err; return false; }
+        } else if (!ck(cudaMemcpyAsync(cache_.device_slot(slot), b, (size_t) lay.blob_bytes(s.layer), cudaMemcpyHostToDevice,
+                                       refill_), "refill", err))
             return false;
-        res_[out] = kNotResident;              // evicted now: the CPU computes it meanwhile
+        if (fr != nullptr) fr->pop_back();
+        else *victim = kNotResident;           // evicted now: the CPU computes it meanwhile
         pending_.emplace_back((int32_t) in, slot);
         ++swaps_;
+    }
+    if (foreign()) {
+        if (xdev_.refill_record(err)) return true;
+        err = "peer experts: refill event: " + err;
+        return false;
     }
     return ck(cudaEventRecord(refill_ev_, refill_), "refill event", err);
 }
 
 void PeerExperts::apply_pending(bool wait) {
     if (pending_.empty()) return;
-    {
+    if (foreign()) {   // a decode reads a slot only once the library says its fill is done
+        std::string e;
+        const int done = xdev_.refill_done(wait, &e);
+        if (done < 0) {   // the fills failed: their slots stay free, and the next adapt fills them again
+            std::fprintf(stderr, "strata generate: the AMD tier's refill failed: %s\n", e.c_str());
+            if (free_.empty()) free_.resize((size_t) n_layers_);
+            for (const auto& [i, slot] : pending_) free_[(size_t) (i / n_expert_)].push_back(slot);
+            pending_.clear();
+            return;
+        }
+        if (done != 1) return;
+    } else {
         On on(device_);
         if (wait) cudaEventSynchronize(refill_ev_);
         else if (cudaEventQuery(refill_ev_) != cudaSuccess) return;
     }
     for (const auto& [i, slot] : pending_) res_[(size_t) i] = slot;
     pending_.clear();
+}
+
+// Only adapt calls it, between windows, so no decode reads the slot while it changes hands.
+void PeerExperts::release(int64_t layer, int64_t expert) {
+    const int32_t i = (int32_t) (layer * n_expert_ + expert);
+    int32_t slot = res_[(size_t) i];
+    res_[(size_t) i] = kNotResident;
+    for (size_t k = 0; slot < 0 && k < pending_.size(); ++k)   // still filling: its slot is freed the same way
+        if (pending_[k].first == i) {
+            slot = pending_[k].second;
+            pending_.erase(pending_.begin() + (ptrdiff_t) k);
+        }
+    if (slot < 0) return;
+    if (free_.empty()) free_.resize((size_t) n_layers_);
+    free_[(size_t) layer].push_back(slot);
 }
 
 }  // namespace strata::core

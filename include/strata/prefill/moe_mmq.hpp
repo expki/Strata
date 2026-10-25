@@ -54,6 +54,10 @@ void quantize_scatter(const float* x, const int32_t* slot, const int32_t* src, v
                       int64_t ld, int64_t tokens, int k_used, void* stream);
 
 constexpr int kGatherGroupMax = 16;
+/// The prompt path's experts per MMQ launch (MMQ_GROUP in src/prefill/prefill.cpp), which the AMD tier library's prompt rows use too.
+constexpr int kGroup = 16;
+/// The zeroed bytes after a group buffer's last expert, which MMQ may read past a matrix's end (MMQ_TAIL in src/prefill/prefill.cpp).
+constexpr size_t kTail = 4096;
 /// STRATA_MMQ_DIRECT: each expert's own weight address (gate|up or down), in place of `w + z * expert_bytes` -
 /// expert z < n <= kGatherGroupMax starts at p[z].  The launch (tiles, stream-k split, fixup) is the same as
 /// with `w`: only the base address of each expert's matrix changes.

@@ -85,6 +85,8 @@ void handoff_publish(float* dst, const float* a, int64_t na, const float* b, int
 /// The reading stage's hand-off wait, bounded: spin until *flag >= value, or after timeout_ns (0: no bound) set
 /// *err = 1 (mapped) and return, so the window's graph completes and the host fails the window cleanly.
 void wait_handoff(const uint32_t* flag, uint32_t value, uint32_t* err, unsigned long long timeout_ns, void* stream);
+/// One thread: a system fence, then a volatile store of `value` to `flag` (mapped host memory), ordered after the stream's earlier work.
+void raise_flag(uint32_t* flag, uint32_t value, void* stream);
 /// wait_flag_ge, also writing the GPU's clock (ns, gpu_stamp's) as the kernel starts into *t_in and as it returns
 /// into *t_out (either may be null): the verify window's PCIe-share balance, at no extra launch.
 void wait_flag_ge_stamped(const uint32_t* flag, uint32_t value, unsigned long long* t_in, unsigned long long* t_out,

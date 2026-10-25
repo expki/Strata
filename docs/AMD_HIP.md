@@ -7,7 +7,9 @@ RX 9070 / 9070 XT / Radeon AI PRO R9700 (RDNA4, gfx1201; see [RDNA4](#rdna4-gfx1
 cards](#community-validated-cards)); the RX 6800 / 6900 series (RDNA2, gfx1030) builds and runs too, reported by a community machine and not yet validated by the maintainers (see [RDNA2](#rdna2-gfx1030)). Setup chooses it by itself on a PC with no NVIDIA card Strata can use (`--backend hip` on a PC with both); the
 install steps for users are in [INSTALL.md](INSTALL.md#amd-cards). gfx906 (Instinct MI50 / MI60, Radeon VII; wave64) has a separate
 opt-in build, see [gfx906](#gfx906-instinct-mi50--mi60-radeon-vii-wave64-built-from-source). The Ryzen AI Max "Strix Halo" APU (gfx1151, RDNA3.5, unified memory) has its own page: [STRIX_HALO.md](STRIX_HALO.md). The ready-made 0.2.0 installers and engine packages for AMD cards are listed in [Ready-made packages](#ready-made-packages-020). Other AMD architectures and mixed
-AMD/NVIDIA execution in one run are not supported.
+AMD/NVIDIA execution in one run are not supported, with one experimental exception on Linux: the NVIDIA engine can keep
+part of a model's experts on one AMD card and let that card compute them. See
+[NVIDIA and AMD together](MULTI_GPU.md#nvidia-and-amd-together-experimental).
 
 The backend maps the CUDA-shaped runtime and BLAS calls to HIP/hipBLAS, uses
 RDNA2/RDNA3/RDNA4's signed integer dot instruction for quantized kernels, and supplies

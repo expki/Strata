@@ -21,7 +21,9 @@ the same app code drives NVIDIA cards, but we have not run two models on two NVI
 
 **One make of card per engine.** An engine drives one make of card (NVIDIA, AMD or Intel). The app, `strata launch` and setup
 offer only the cards the engine can drive, never split a model across two makes, say in one plain line when the other make has
-the bigger card, and say that two models at once on two makes is not supported.
+the bigger card, and say that two models at once on two makes is not supported. One exception, experimental and built
+from source on Linux only: the NVIDIA engine can use one AMD card as an extra expert cache. The app, `strata launch` and
+setup do not set it up. See [NVIDIA and AMD together](#nvidia-and-amd-together-experimental).
 
 ## Using it
 
@@ -530,3 +532,202 @@ These are opt-in settings on one rig, not defaults.
 
 With a layer split, `--batch N --batch-groups G --trim-stage-weights` decodes several conversations together and
 pipelines them through the cards: see [BATCHING.md](BATCHING.md).
+
+## NVIDIA and AMD together (experimental)
+
+**What it does.** On a PC with NVIDIA cards and one AMD card, one model can use both makes. The NVIDIA engine runs the
+model as usual, on one card or split across several. The AMD card holds more of the model's experts: the ones no
+NVIDIA card has room for. It computes those experts itself, while it answers and while it reads a prompt. Without it,
+the CPU computes every expert that is not on a card, and that is the slow part when a model does not fit in VRAM.
+
+- The AMD card's experts change while the server runs, as the NVIDIA cards' do. An expert is on one card at a time.
+- The two makes never talk to each other directly. The inputs and the results go through pinned RAM.
+- It is off unless the engine gets `--peer-device hip:N`. Without that flag the answers are byte-identical to the build
+  before this feature (checked below).
+- It is for Linux and the NVIDIA (CUDA) engine, with one AMD card and a native pack. The limits are at the end of this
+  section.
+
+**Build it** (from source, on Linux with ROCm). The engine is the usual CUDA build. The AMD part is a library,
+`libstrata_xtier_hip.so`. Build it in its own HIP build tree with `-DSTRATA_XTIER=ON`, which needs
+`-DSTRATA_PREFILL_MMQ=ON`. Set the architecture to your card's ([AMD_HIP.md](AMD_HIP.md#build) has the other HIP
+flags):
+
+```sh
+cmake -S . -B build-hip -DCMAKE_BUILD_TYPE=Release -DSTRATA_ENABLE_HIP=ON -DSTRATA_ENABLE_CUDA=OFF \
+  -DSTRATA_PREFILL_MMQ=ON -DSTRATA_XTIER=ON -DCMAKE_HIP_ARCHITECTURES=gfx1030
+cmake --build build-hip --target strata_xtier_hip
+```
+
+- The engine looks for the library next to its own file, or where `STRATA_XTIER_LIB` points.
+- The library needs ROCm's libraries when it runs, `libhipblas` among them. Put `/opt/rocm/lib` in the config's
+  `"lib_dirs"` (or on `LD_LIBRARY_PATH`). Without it the start stops and asks "is /opt/rocm/lib on LD_LIBRARY_PATH?".
+- Build the library and the engine from the same commit. The engine checks the library's interface number and the
+  sizes of the structures the two share, and refuses the library if either differs.
+
+**The config.** This is the test box's config, without its picture settings. Next to an NVIDIA config it has
+`--peer-device hip:0` at the end of `"args"`, the ROCm folder in `"lib_dirs"` and `STRATA_XTIER_LIB` in `"env"`:
+
+```json
+{
+ "exe": "/home/you/strata/build-cuda/strata",
+ "args": ["--pack", "/home/you/Strata-data/packs/swift-iq4_xs",
+          "--native", "/home/you/models/ukisai_Swift-1.5-Qwen3.8-Flash-Next-IQ4_XS-00001-of-00003.gguf",
+          "--ple-gguf", "/home/you/models/ukisai_Swift-1.5-Qwen3.8-Flash-Next-IQ4_XS-00001-of-00003.gguf",
+          "--expert-profile", "/home/you/strata/data/expert-profile.bin", "--mmap-experts",
+          "--expert-cache", "auto", "--prefill", "auto", "--spec", "4", "--spec-min-p", "0.5",
+          "--mtp", "/home/you/Strata-data/mtp/rt", "--max-context", "262144", "--kv", "int8", "--pool-workers", "15",
+          "--peer-device", "hip:0"],
+ "cwd": "/home/you/strata",
+ "tokenizer": "/home/you/Strata-data/packs/swift-iq4_xs/tokenizer",
+ "model_name": "swift-1.5-qwen3.8-flash-next-iq4_xs",
+ "arch": "qwen4exp",
+ "backend": "cuda",
+ "gpu": [0, 1, 2],
+ "layer_split": "auto",
+ "lib_dirs": ["/usr/local/cuda/lib64", "/opt/rocm/lib"],
+ "env": {"STRATA_XTIER_LIB": "/home/you/strata/build-hip/libstrata_xtier_hip.so"}
+}
+```
+
+- `"gpu"` lists the NVIDIA cards only, here three as a layer split.
+- `hip:0` is the first AMD card. N counts the AMD cards only, from 0. If you set `HIP_VISIBLE_DEVICES` yourself, N
+  counts the cards it leaves visible.
+- `"lib_dirs"` has both runtimes. `"env"` says where the library is, because it was built in another tree.
+- `--peer-reserve-mib` and `--peer-slots` size the AMD card's share as they do for a second NVIDIA card
+  ([SECOND_GPU.md](SECOND_GPU.md#peer-tier---peer-device)). The AMD card's buffers for reading prompts come out of
+  `--peer-reserve-mib` (600 MiB by default), the memory the experts leave free on the card.
+
+At the start the log says how much the AMD card took:
+
+```
+strata generate: AMD tier on HIP device 0: 12588 experts, 31.21 GiB (filled in 16.4 s); with the NVIDIA cards' 9844 that is 22432 of 24576 on the GPUs
+strata generate: AMD tier ownership: disjoint (STRATA_XTIER_OWNERSHIP=disjoint|move)
+```
+
+After each request the server's line gives the AMD card's share of the experts the answer used. This one is from
+the stop test below:
+
+```
+[strata] done: 128 tokens in 2 s (100.4 tok/s) (length, cancel=False), expert cache 98.9% hit (+47.6% of the routed experts on the AMD tier)
+```
+
+The engine's hit-rate line says the same and adds how many experts the AMD card took in since the start. This one is
+from a run on the test box, in the setup measured below plus `STRATA_DECODE_TIMING=1`, on the build that added the
+AMD card's part of this line:
+
+```
+strata serve: decode expert cache hit rate: 99.4% (50702 hits / 51020 lookups); the AMD tier computed 27700 entries (35.2% of all 78720 routed) and took in 49 experts since the start
+```
+
+**Measured** on the test box (Linux, Ubuntu 24.04): an RTX 3050 8 GB, an RTX 3080 Ti 12 GB and an RTX 3090 24 GB as a
+layer split, a Radeon PRO W6800 32 GB (gfx1030), an EPYC 7F52 (16 cores) and 62 GB of RAM. CUDA 13.2, ROCm 7.2.4.
+The model is Swift 1.5 IQ4_XS, with 60.9 GiB of experts, so most of them do not fit on the cards.
+
+How it was measured, on 2026-10-25:
+- One server start per setup. The page cache was emptied before each start.
+- One unmeasured pass, then three measured passes. A pass is three short chats and two long prompts (3,930 and
+  15,846 tokens), 128 new tokens each, greedy. The conversation cache was off (`--conversation-cache-mib 0`), so every
+  prompt was read in full.
+- The 3090 and the 3080 Ti were capped at 250 W, with their clocks locked (the 3090 at 1500 MHz, the 3080 Ti at
+  1095 MHz). The 3050 (130 W) and the W6800 (213 W) ran at their default limits.
+- The numbers are tokens per second, the mean of the three passes, with the lowest and the highest in brackets.
+- The table and the identity check below ran on the same build. One later change adds the AMD card's part to the
+  engine's hit-rate line above. The other later changes were checked with the tests and the answer comparison below,
+  not timed again.
+
+| Setup | Chat answers | 4K prompt | 16K prompt |
+|---|---|---|---|
+| The three NVIDIA cards alone | 34.4 (32.7 to 36.4) | 369.5 (323.0 to 410.2) | 526.0 (482.6 to 568.0) |
+| The W6800 alone (the AMD engine) | 24.2 (22.3 to 25.5) | 425.7 (420.0 to 431.6) | 678.3 (671.9 to 690.7) |
+| The three NVIDIA cards and the W6800 | 90.7 (87.1 to 93.6) | 1,019.3 (1,010.2 to 1,035.4) | 1,476.9 (1,460.6 to 1,494.7) |
+
+- With the W6800 beside them, the NVIDIA cards answer chats 2.6 times as fast, and read a 16K prompt 2.8 times as
+  fast. Together they read a 16K prompt 2.2 times as fast as the W6800 alone.
+- The answers after the long prompts got faster too: 87.7 and 92.6 tok/s with both makes, 41.2 and 75.0 with the
+  NVIDIA cards alone.
+- The first request after a start, with the page cache empty, is slower for every setup. A short chat answered at
+  35.4 tok/s with both makes, 15.7 with the NVIDIA cards alone and 10.2 with the W6800 alone.
+- The highest power draw over 5 seconds was 391 W with both makes, 260 W with the NVIDIA cards alone and 256 W with
+  the W6800 alone. That is the four cards together, as nvidia-smi and the W6800's sensor report it (each an average
+  over about a second). The CPU and the rest of the PC are not in it.
+
+Without `--peer-device hip:N`, this build gave the same text as the build before it, byte for byte. That was checked
+on the NVIDIA engine (the three cards) and on the AMD engine (the W6800), with three chats and the 3,930-token prompt,
+128 tokens each, greedy, and `--prompt-cache 0 --adapt-swaps 0 --pcie-frac 0 --conversation-cache-mib 0` (the
+settings for byte-identical repeats, see [DETAILS.md](DETAILS.md)). Two starts of the older build matched each other
+too. With the AMD card on, 40 rounds of stopping an answer part-way and sending the next request at once
+(`tools/stop_resend_test.py`) gave real text every time, and the next answer was the same as the first one after the
+start.
+
+With `--peer-device hip:N` the answers are close to the NVIDIA cards' answers but not the same text: the AMD card
+computes experts the CPU computed before, and its prompt rows come back in FP16, so the sums round differently. On
+the latest build, on the test box with the same caps, chats, 3,930-token prompt and settings as the check above, 3
+of the 4 answers differed from those of the three NVIDIA cards alone, after the first 11, 23 and 57 of 128 tokens.
+All three stayed on topic in other words: the word list's summary, how a refrigerator works and the language tips.
+
+**Switches.** The defaults are the measured best. The others are there to compare or to look for a problem.
+
+| Variable | Default | What it does |
+|---|---|---|
+| `STRATA_XTIER_LIB` | next to the engine | Where the library is. |
+| `STRATA_XTIER_WAIT_MS` | 30000 | How long the engine waits for the AMD card's answer, in milliseconds. |
+| `STRATA_XTIER_KEEPWARM` | 1 | `0` turns off the short spin that keeps the AMD card's clock up while it works. |
+| `STRATA_XTIER_PREFILL` | 1 | `0` keeps the AMD card out of prompts. It then helps only while answering. |
+| `STRATA_XTIER_OWNERSHIP` | `disjoint` | `move` lets an NVIDIA card take an expert away from the AMD card. Measured slower. |
+| `STRATA_XTIER_TAIL_SKIP` | 0 | `1` lets the route tail skip (`STRATA_ROUTE_TAIL_SKIP`, [DETAILS.md](DETAILS.md)) run beside the AMD card. It changes answers slightly. The numbers are below. |
+| `STRATA_XTIER_CHECK` | 0 | `1` checks after every adaptive round that no expert is on two cards. A failed check ends the engine. For finding bugs. |
+| `STRATA_XTIER_TIMING` | 0 | `1` logs the AMD card's time per request: the launch, the wait, the copies and the kernels. For finding slow spots. |
+
+**Why the AMD card's clock matters.** The AMD card's work comes in short bursts. Between the bursts the W6800 drops
+to its lowest clock, 500 MHz of 2,555. So the library runs a short spin on the card while the engine decodes or reads
+a prompt, which keeps the clock up. The spin stops at most 20 ms after the last bit of work. Measured on the same box
+with no power caps and no clock locks, before the AMD card read prompts (3 passes each):
+- Chat answers: 65.2 tok/s without the spin, 100.1 with it.
+- Power during those requests: the W6800 drew 26.5 W on average without the spin and 35 W with it. Energy per token
+  was not measured.
+- A minute after the last request the W6800 was back at 0 MHz and 7.0 W, the same as before the start.
+
+What the other defaults are worth, on the same box:
+- `STRATA_XTIER_PREFILL=0` (the AMD card out of prompts): 4K prompt 500.0 tok/s and 16K prompt 588.4, against 1,008.3
+  and 1,452.4 with it on. Same caps and clock locks as the table above, 3 passes each.
+- `STRATA_XTIER_OWNERSHIP=move`: chat answers 40.0 tok/s against 66.6 for `disjoint`. No power caps, before the spin
+  was added, 3 passes each.
+- `STRATA_XTIER_TAIL_SKIP=1`: chat answers 93.1 tok/s (92.3 to 93.9) against 88.8 (82.8 to 92.1) without it. Same caps
+  and clock locks as the table above, one server start each, 3 passes. The two ranges nearly touch (92.1 and 92.3).
+  Without it, one chat ran at 65.6 tok/s in one pass and at 86.5 and 85.1 in the other two. With it, that chat
+  accepted 64 to 65 of 136 to 138 drafts per pass, against 70 to 73 of 126 to 128 without it. Prompts: 4K 1,007.2
+  against 1,009.6, 16K 1,463.9 against 1,469.4, the ranges overlapping. It changes the answers slightly, so it stays
+  off by default.
+
+**Power.** The AMD card adds its own power draw to the NVIDIA cards'. The test box's power supply switched off once,
+with all four cards reading a prompt at the same time and no power caps. It needed a power cycle at the wall. Before
+you run this, check that the power supply has room for every card at full load plus the CPU. A power cap lowers what
+an NVIDIA card may draw: `sudo nvidia-smi -i N -pl W` sets one until the next reboot. The numbers above ran with the
+3090 and the 3080 Ti capped at 250 W. Every run on the box since the trip had those caps, and none tripped it.
+
+**Limits.**
+- One AMD card: `hip:N` names one.
+- Native packs only (`--native`). The start stops with a plain message for a canonical pack, an NVFP4 pack or a pack
+  with folded Hadamard rotations (APR).
+- Linux only. It has not been built or run on Windows.
+- The NVIDIA (CUDA) engine only. The AMD engine and the Mac engine refuse `hip:N` at start.
+- If the AMD card stops answering while the engine reads a prompt or writes an answer, the engine waits
+  `STRATA_XTIER_WAIT_MS` (30 s by default), logs `the AMD tier did not answer within STRATA_XTIER_WAIT_MS` and ends.
+  As it ends, it does not wait for the AMD card again. Restart the server, without `--peer-device hip:N` if the card
+  still does not answer. This is read from the code. It was not tried with a hung card.
+- With the AMD card on, the route tail skip (unless `STRATA_XTIER_TAIL_SKIP=1`) and the automatic PCIe share are off,
+  as with a second NVIDIA card. `--pipeline-windows`, `--kv-grow` and `STRATA_PIN_BY_NEED` stay off too.
+- `STRATA_PREFILL_HELP=1` does not help a stage that gives its prompt rows to the AMD card. Every stage does, unless
+  `STRATA_XTIER_PREFILL=0` or `--peer-prefill-rows 0` is set, or the log says the stage "reads its prompts without
+  the AMD tier".
+- On an NVIDIA card of compute capability 12.0 with 80 or more SMs (an RTX 5080 or 5090, an RTX PRO 5000 or 6000),
+  the fused prompt kernels are on by default for packs whose gate and up weights are IQ2_S, IQ3_XXS, IQ3_S or
+  IQ4_XS. The AMD card then takes no prompt rows: the log says the stage "reads its prompts without the AMD tier".
+  `STRATA_PF_FUSED=0` gives them back. This is read from the code. No such card was tried.
+- A small `--peer-reserve-mib` might end the engine in the middle of a prompt, because the AMD card's prompt kernels
+  take some of their memory only when they run. This is read from the code. It was not tested.
+- The prompt chunk plan counts the AMD card's experts as experts read from the drive. On the test box that cut the
+  chunk from 6,144 to 4,096 tokens. Even so, the chunk it picked was the fastest of the three tried (the setup of the
+  table above, 3 passes each): a 16K prompt read at 1,467.8 tok/s with the plan's chunk (4 chunks of about 3,962
+  tokens), 1,434.9 with `--prefill 6144`, and 1,465.2 with `--prefill 8192` (which fell back to 4,096).
+- Not measured: one NVIDIA card plus the AMD card, other AMD cards than the W6800, other models.

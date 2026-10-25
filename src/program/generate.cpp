@@ -37,6 +37,7 @@
 #include "strata/core/remote_experts.hpp"
 #include "strata/core/on_device.hpp"
 #include "strata/core/peer_experts.hpp"
+#include "strata/core/xtier.hpp"
 #include "strata/core/layer.hpp"
 #include "strata/core/layout.hpp"
 #include "strata/core/session.hpp"
@@ -571,6 +572,7 @@ struct Options {
     /// there, `peer_slots` caps its size (0 = as many as fit), `peer_adapt_swaps` per adaptive round
     /// (-1 = adapt_swaps).
     int peer_device = -1;
+    int peer_hip = -1;              ///< --peer-device hip:N: the tier on AMD card N through the AMD tier library (-1 = off)
     int peer_reserve_mib = 600;
     int64_t peer_slots = 0;
     int peer_adapt_swaps = -1;
@@ -2740,7 +2742,13 @@ int main(int argc, char** argv) {
         else if (a == "--adapt-swaps") o.adapt_swaps = std::atoi(next("--adapt-swaps"));
         else if (a == "--expert-cache-cpu-order") o.expert_cache_cpu_order = true;
         else if (a == "--expert-cache-per-layer") o.expert_cache_per_layer = true;
-        else if (a == "--peer-device") o.peer_device = std::atoi(next("--peer-device"));
+        else if (a == "--peer-device") {
+            strata::core::xtier::PeerSpec ps;
+            std::string e;
+            if (!strata::core::xtier::parse_peer_device(next("--peer-device"), ps, e)) { std::fprintf(stderr, "%s\n", e.c_str()); return 2; }
+            o.peer_device = ps.hip >= 0 ? -1 : std::max(ps.cuda, 0);   // "0" stays 0, as atoi made it
+            o.peer_hip = ps.hip;
+        }
         else if (a == "--peer-reserve-mib") o.peer_reserve_mib = std::atoi(next("--peer-reserve-mib"));
         else if (a == "--peer-slots") o.peer_slots = std::atoll(next("--peer-slots"));
         else if (a == "--peer-adapt-swaps") o.peer_adapt_swaps = std::atoi(next("--peer-adapt-swaps"));
@@ -2793,6 +2801,11 @@ int main(int argc, char** argv) {
         }
         }
     }
+    const bool peer_any = o.peer_device >= 1 || o.peer_hip >= 0;   // a peer expert tier of either make
+    const bool peer_flag = o.peer_device >= 0 || o.peer_hip >= 0;  // --peer-device given at all, "0" included
+    // hip:N sets HIP_VISIBLE_DEVICES here, before any thread may read the environment
+    const strata::core::xtier::HipCard hip_card =
+        o.peer_hip >= 0 ? strata::core::xtier::claim_hip_card(o.peer_hip) : strata::core::xtier::HipCard{};
 #if defined(STRATA_USE_HIP)
     {   // gfx1151 (Strix Halo): the switches that are exact there are on by default (strata/core/arch_defaults.hpp); before
         // any engine code reads its switches (they are read at first use), and the user's own settings are kept
@@ -3368,10 +3381,12 @@ int main(int argc, char** argv) {
     }
     // the peer tier is the second card's only user: a layer split or a remote expert cache would put a second engine
     // part (and a second copy of the same experts) on it
-    if (o.peer_device >= 1 && (!o.layer_split.empty() || o.expert_cache_remote[0] > 0)) {
+    // an AMD card cannot be a stage, so --peer-device hip:N may sit beside a layer split
+    if ((o.peer_device >= 1 && !o.layer_split.empty()) || (peer_any && o.expert_cache_remote[0] > 0)) {
         std::fprintf(stderr, "strata generate: --peer-device cannot be combined with %s\n",
-                     !o.layer_split.empty() ? "--layer-split (use one or the other)"
-                                            : "--expert-cache-device1..3 (the peer tier already caches experts there)");
+                     o.peer_device >= 1 && !o.layer_split.empty() ? "--layer-split (use one or the other)"
+                     : o.peer_hip >= 0 ? "--expert-cache-device1..3 (an expert could sit on the AMD card and a helper card at once)"
+                                       : "--expert-cache-device1..3 (the peer tier already caches experts there)");
         return 2;
     }
 
@@ -4264,7 +4279,7 @@ int main(int argc, char** argv) {
         on = false;
 #endif
         const bool helpers_a = o.expert_cache_remote[0] > 0 || o.expert_cache_remote[1] > 0 || o.expert_cache_remote[2] > 0;
-        on = on && !o.mtp.empty() && o.spec >= 2 && o.batch == 0 && o.peer_device < 0 && !helpers_a && !o.adapt_async;
+        on = on && !o.mtp.empty() && o.spec >= 2 && o.batch == 0 && !peer_flag && !helpers_a && !o.adapt_async;
         o.pipeline_windows = on ? 2 : 0;
         if (on)
             std::fprintf(stderr, "strata generate: --pipeline-windows 2 is on by default for a layer split of %zu stages "
@@ -4280,7 +4295,7 @@ int main(int argc, char** argv) {
                         : split_devs.size() > 1 && o.adapt_async ? "not with --adapt-async on three or more stages"
                         : o.mtp.empty() || o.spec < 2 ? "it needs the MTP drafter (--mtp, --spec)"
                         : o.batch != 0 ? "not with --batch slots"
-                        : o.peer_device >= 1 ? "not with --peer-device"
+                        : peer_any ? "not with --peer-device"
                         : helpers ? "not with the helper caches (--expert-cache-device1..3, --remote-expert-opt)"
                         : nullptr;
         if (off != nullptr) {
@@ -5204,7 +5219,7 @@ int main(int argc, char** argv) {
                             !o.expert_profile.empty() && !o.resident_cpu_experts && o.expert_cache != 0 && !remote &&
                             strata::core::vmm_available() &&
                             // the batch slots carve their own K/V and --vram-elastic's cache is not one VMM range
-                            o.batch == 0 && !o.vram_elastic && o.peer_device < 0;
+                            o.batch == 0 && !o.vram_elastic && !peer_flag;
             if (asked && !on)
                 std::fprintf(stderr, "strata generate: --kv-grow is off (one GPU, a profile, the whole K/V in VRAM, "
                                      "every expert in RAM, no --batch, --vram-elastic or --peer-device)\n");
@@ -5838,7 +5853,7 @@ int main(int argc, char** argv) {
         size_t pin_nonres = 0;                               // (how many of them are the non-resident estimate)
         if (const char* pn = std::getenv("STRATA_PIN_BY_NEED"); pn != nullptr && pn[0] != '\0' && pn[0] != '0') {
             const char* off_why = profile.empty() ? "it needs --expert-profile (the ranking)"
-                                : multi_gpu || o.peer_device >= 1 ? "not with a layer split or a peer GPU"
+                                : multi_gpu || peer_any ? "not with a layer split or a peer GPU"
                                 : std::any_of(o.expert_cache_remote.begin(), o.expert_cache_remote.end(),
                                               [](int n) { return n > 0; }) ? "not with helper caches on other GPUs"
                                 : nullptr;
@@ -6749,11 +6764,11 @@ int main(int argc, char** argv) {
 
     // ---- Multi-GPU: the second GPU's expert tier, filled with the ranked pairs the primary does not hold
     strata::core::PeerExperts peer;
+    if (peer_any && (profile.empty() || srcp == nullptr || o.expert_cache <= 0)) {
+        std::fprintf(stderr, "strata generate: --peer-device needs --expert-profile and the expert cache\n");
+        return 1;
+    }
     if (o.peer_device >= 1) {
-        if (profile.empty() || srcp == nullptr || o.expert_cache <= 0) {
-            std::fprintf(stderr, "strata generate: --peer-device needs --expert-profile and the expert cache\n");
-            return 1;
-        }
         const auto tp0 = Clock::now();
         if (!peer.open(o.peer_device, profile, xcache, *srcp, g.n_layers, g.n_expert, o.peer_reserve_mib, o.peer_slots,
                        err)) {
@@ -6764,7 +6779,37 @@ int main(int argc, char** argv) {
                              "%lld that is %lld of %lld on the GPUs\n", o.peer_device, (long long) peer.resident(), peer.gib(),
                      std::chrono::duration<double>(Clock::now() - tp0).count(), (long long) xcache.slots(),
                      (long long) (peer.resident() + xcache.slots()), (long long) (g.n_layers * g.n_expert));
+    } else if (o.peer_hip >= 0) {   // the AMD tier takes the ranked pairs no NVIDIA card holds, across every stage
+        int64_t nv_slots = xcache.slots();
+        for (const auto& st : stages) nv_slots += st->cache.slots();
+        const auto held = [&](int32_t l, int32_t e) {
+            const int st = multi_gpu ? stage_of(l) : 0;
+            return (st > 0 ? stages[(size_t) st - 1]->cache : xcache).slot_of(l, e) >= 0;
+        };
+        const auto tp0 = Clock::now();
+        if (!peer.open_foreign(hip_card, profile_all.empty() ? profile : profile_all, held, *srcp, g.n_layers, g.n_expert,
+                               o.peer_reserve_mib, o.peer_slots, err)) {
+            std::fprintf(stderr, "strata generate: %s\n", err.c_str());
+            return 1;
+        }
+        std::fprintf(stderr, "strata generate: AMD tier on HIP device %d: %lld experts, %.2f GiB (filled in %.1f s); with the "
+                             "NVIDIA cards' %lld that is %lld of %lld on the GPUs\n", o.peer_hip, (long long) peer.resident(),
+                     peer.gib(), std::chrono::duration<double>(Clock::now() - tp0).count(), (long long) nv_slots,
+                     (long long) (peer.resident() + nv_slots), (long long) (g.n_layers * g.n_expert));
     }
+    // STRATA_XTIER_OWNERSHIP=move lets a stage take an expert from the AMD tier, disjoint (measured faster) does not
+    bool peer_move = false;
+    if (peer.foreign()) {
+        const char* v = std::getenv("STRATA_XTIER_OWNERSHIP");
+        peer_move = v != nullptr && std::strcmp(v, "move") == 0;
+        if (v != nullptr && !peer_move && std::strcmp(v, "disjoint") != 0)
+            std::fprintf(stderr, "strata generate: STRATA_XTIER_OWNERSHIP=%s is neither disjoint nor move, so it is "
+                                 "disjoint\n", v);
+        std::fprintf(stderr, "strata generate: AMD tier ownership: %s (STRATA_XTIER_OWNERSHIP=disjoint|move)\n",
+                     peer_move ? "move" : "disjoint");
+    }
+    // STRATA_XTIER_TAIL_SKIP=1 lets the route tail skip run beside the AMD tier, on the experts no card holds
+    const bool xtier_tail = peer.foreign() && [] { const char* v = std::getenv("STRATA_XTIER_TAIL_SKIP"); return v != nullptr && std::atoi(v) != 0; }();
 
     if (remote_opt && !remote_opt->init(err)) { std::fprintf(stderr, "strata generate: %s\n", err.c_str()); return 1; }
     Drive drive;
@@ -6781,6 +6826,7 @@ int main(int argc, char** argv) {
     for (int r = 0; r < 3; ++r) if (o.expert_cache_remote[(size_t) r] > 0)
         drive.d.remote[drive.d.remote_count++] = &remote_experts[(size_t) r];
     drive.d.peer = peer.valid() ? &peer : nullptr;
+    drive.d.peer_tail_skip = xtier_tail;
     drive.d.hit_cpu_order = o.expert_cache_cpu_order;
     drive.d.split_rows = !o.no_split_rows;
     drive.d.pool = &pool;
@@ -8881,7 +8927,22 @@ int main(int argc, char** argv) {
                                      "context, or read prompts in smaller chunks (--prefill 512)\n");
             return 1;
         }
-        if (peer.valid() && o.peer_prefill_rows != 0) {
+        // STRATA_XTIER_PREFILL=0: the AMD tier takes no prompt rows (the A/B)
+        const bool xtier_prompt = [] { const char* v = std::getenv("STRATA_XTIER_PREFILL"); return v == nullptr || std::atoi(v) != 0; }();
+        if (peer.foreign() && (!xtier_prompt || o.peer_prefill_rows == 0)) {
+            std::fprintf(stderr, "strata serve: the AMD tier takes no prompt rows (%s)\n",
+                         !xtier_prompt ? "STRATA_XTIER_PREFILL=0" : "--peer-prefill-rows 0");
+        } else if (peer.foreign()) {   // every stage hands it the rows of the experts it holds
+            std::vector<std::pair<strata::prefill::Prefill*, int>> paths{{&sp, primary_device}};
+            for (const auto& st : stages) paths.emplace_back(&st->sp, st->dev);
+            for (size_t i = 0; i < paths.size(); ++i) {
+                const strata::core::OnDevice on(paths[i].second);
+                if (!paths[i].first->set_peer(&peer, 0, err)) {
+                    std::fprintf(stderr, "strata serve: %s - stage %zu reads its prompts without the AMD tier\n", err.c_str(), i);
+                    err.clear();
+                }
+            }
+        } else if (peer.valid() && o.peer_prefill_rows != 0) {
             const int64_t rows = o.peer_prefill_rows > 0 ? o.peer_prefill_rows : o.prefill_chunk * K / 2;
             if (!sp.set_peer(&peer, rows, err)) {
                 std::fprintf(stderr, "strata serve: %s - the prompt path stays on the primary GPU\n", err.c_str());
@@ -8901,6 +8962,19 @@ int main(int argc, char** argv) {
                 }
             }
         }
+        // the stages outlive the AMD tier (declared before it), so their prompt paths let go of it first
+        struct StagePeersOff {
+            std::vector<std::unique_ptr<GpuStage>>& stages;
+            bool foreign;
+            ~StagePeersOff() {
+                if (!foreign) return;
+                std::string e;
+                for (const auto& st : stages) {
+                    const strata::core::OnDevice on(st->dev);
+                    (void) st->sp.set_peer(nullptr, 0, e);
+                }
+            }
+        } stage_peers_off{stages, peer.foreign()};
         mem_mark("the head and the prompt path");
         // #340: STRATA_SPLIT_SMALL_OWN=S (tokens): on a layer split, every stage that borrows keeps the slots for an
         // S-token chunk's buffers for the whole session (0.1.29's own buffers, carved from the tail of its cache):
@@ -9981,7 +10055,8 @@ int main(int argc, char** argv) {
         // a verify window routes at rank 7 or lower is neither copied nor computed (answers differ slightly from 0.1.41,
         // KL ~0.003-0.006; docs/DETAILS.md).  =0 restores 0.1.41's bytes.  Nothing to do, so no default and no line, when every
         // expert is in VRAM; off with --batch slots (a window then mixes requests, and one request's skip would depend on
-        // another's tokens) and, as in the dispatch, with a peer or helper GPU.  A layer split is fine: each stage skips by itself.
+        // another's tokens) and, as in the dispatch, with a peer or helper GPU (an AMD tier opts in with STRATA_XTIER_TAIL_SKIP=1).
+        // A layer split is fine: each stage skips by itself.
         {
             const char* tse = std::getenv("STRATA_ROUTE_TAIL_SKIP");
             // #1884: with nearly every expert in the GPU cache (V100 32 GB, Coder IQ1_M: 94.8% of the experts, 99.9% decode hits) the few
@@ -10009,17 +10084,21 @@ int main(int argc, char** argv) {
                                     f.d_type == strata::kernels::cpu::kNvfp4Type;
             const bool tail_default_path = tse == nullptr && !all_experts_resident && !nearly_all_cached && o.batch == 0 &&
                                            decode_defaults_arch_ok() &&
-                                           o.peer_device < 0;
+                                           (!peer_flag || xtier_tail);
             const bool tail_default_ok = tail_default_path && !nvfp4_experts;
             if (tail_default_path && nvfp4_experts)
                 std::fprintf(stderr, "strata serve: STRATA_ROUTE_TAIL_SKIP is off by default with NVFP4 experts (it moved an NVFP4 "
                                      "pack's answers by about as much as its quantization does); STRATA_ROUTE_TAIL_SKIP=7 turns it on\n");
-            if (tse == nullptr && nearly_all_cached && o.batch == 0 && o.peer_device < 0 && decode_defaults_arch_ok())
+            if (tse == nullptr && nearly_all_cached && o.batch == 0 && (!peer_flag || xtier_tail) && decode_defaults_arch_ok())
                 std::fprintf(stderr, "strata serve: STRATA_ROUTE_TAIL_SKIP is off by default: %.1f%% of the experts are in the GPU cache, so "
                                      "few are missed and skipping them costs more draft acceptance than it saves; "
                                      "STRATA_ROUTE_TAIL_SKIP=7 turns it on\n", 100.0 * (double) cached_experts / (double) host_res.size());
             if (tail_default_ok) strata::core::set_tail_skip_rank(7);
-            if (strata::core::tail_skip_rank() > 0 && !all_experts_resident)
+            // the dispatch ignores the rank beside the AMD tier unless STRATA_XTIER_TAIL_SKIP=1
+            if (strata::core::tail_skip_rank() > 0 && !all_experts_resident && peer.foreign() && !xtier_tail)
+                std::fprintf(stderr, "strata serve: STRATA_ROUTE_TAIL_SKIP=%d is off beside the AMD tier; STRATA_XTIER_TAIL_SKIP=1 "
+                                     "turns it on there\n", strata::core::tail_skip_rank());
+            else if (strata::core::tail_skip_rank() > 0 && !all_experts_resident)
                 std::fprintf(stderr, "strata serve: STRATA_ROUTE_TAIL_SKIP=%d is ON%s: a missed expert that every token of a verify window routes at rank %d or "
                                      "lower is skipped (+10..20%% decode on 12-16 GB cards that miss experts, answers differ slightly from 0.1.41); "
                                      "STRATA_ROUTE_TAIL_SKIP=0 turns it off\n", strata::core::tail_skip_rank(),
@@ -10028,7 +10107,7 @@ int main(int argc, char** argv) {
         if (o.adapt_every > 0 && o.adapt_swaps > 0 && !all_experts_resident)
             drive.d.usage.assign((size_t) (g.n_layers * g.n_expert), 0.0f);
         PcieAuto pcie_auto;
-        if (o.pcie_frac_auto && !all_experts_resident && o.batch == 0 && o.peer_device < 0 && (n_stages == 1 || pcie_auto_split_ok())) {
+        if (o.pcie_frac_auto && !all_experts_resident && o.batch == 0 && !peer_flag && (n_stages == 1 || pcie_auto_split_ok())) {
             const auto& pl = strata::kernels::cpu::expert_layout();
             double sum = 0.0;
             for (int64_t l = 0; l < g.n_layers; ++l) sum += (double) pl.blob_bytes(l);
@@ -10311,7 +10390,7 @@ int main(int argc, char** argv) {
                 const float* u = drive.d.usage.data() + l * g.n_expert;
                 const int32_t* r = host_res.data() + l * g.n_expert;
                 for (int32_t e = 0; e < (int32_t) g.n_expert; ++e) {
-                    if (r[e] < 0) { if (u[e] >= 2.0f && !(peer.valid() && peer.has(l, e)) && !(remote_opt && remote_opt->owns(l, e)) && !helper_holds(l, e)) cand.emplace_back(u[e], e); }
+                    if (r[e] < 0) { if (u[e] >= 2.0f && !(peer.valid() && !peer_move && peer.has(l, e)) && !(remote_opt && remote_opt->owns(l, e)) && !helper_holds(l, e)) cand.emplace_back(u[e], e); }
                     else vict.emplace_back(u[e], e);
                 }
                 if (cand.empty() || vict.empty()) continue;
@@ -10447,6 +10526,8 @@ int main(int argc, char** argv) {
             // decays: the sum is proportional to the routing itself) - only with --expert-profile-save, else `heat`
             // is empty
             for (size_t i = 0; i < heat.size(); ++i) heat[i] += (double) drive.d.usage[i];
+            if (peer_move)   // the stages took these, so the AMD tier lets them go
+                for (const Swap& s : swaps) peer.release(s.layer, s.in);
             if (peer.valid()) {                   // multi-GPU: the peer takes the next most-routed CPU misses
                 std::vector<int32_t> r0 = host_res;
                 for (const auto& [i, slot] : pending) r0[(size_t) i] = slot;   // swapped into the primary already
@@ -10454,6 +10535,19 @@ int main(int argc, char** argv) {
                 if (!peer.adapt(drive.d.usage.data(), r0.data(),
                                 o.peer_adapt_swaps >= 0 ? o.peer_adapt_swaps : o.adapt_swaps, perr)) {
                     std::fprintf(stderr, "strata serve: %s\n", perr.c_str());
+                    return false;
+                }
+            }
+            static const bool xtier_check = [] {
+                const char* v = std::getenv("STRATA_XTIER_CHECK");
+                return v != nullptr && std::atoi(v) != 0;
+            }();
+            if (xtier_check && peer.valid()) {   // STRATA_XTIER_CHECK=1: an expert on two cards fails the request
+                int64_t both = 0;
+                for (int64_t i = 0; i < g.n_layers * g.n_expert; ++i)
+                    both += host_res[(size_t) i] >= 0 && peer.has(i / g.n_expert, i % g.n_expert);
+                if (both > 0) {
+                    std::fprintf(stderr, "strata serve: %lld experts on two cards\n", (long long) both);
                     return false;
                 }
             }
@@ -12094,7 +12188,7 @@ int main(int argc, char** argv) {
                 strata::core::progress_at(save ? "saving a session" : "restoring a session");
                 if (path.empty()) { refuse("missing path"); continue; }
                 if (!stages.empty() || multi_gpu) { refuse("session files do not support --layer-split"); continue; }
-                if (o.peer_device >= 1) { refuse("session files do not support --peer-device"); continue; }
+                if (peer_any) { refuse("session files do not support --peer-device"); continue; }
                 if (o.batch > 0) { refuse("session files do not support --batch (parallel requests)"); continue; }
                 if (o.prompt_cache <= 0) { refuse("session files need --prompt-cache > 0"); continue; }
                 if (!ver.wait_commit(err)) {
@@ -14208,6 +14302,7 @@ int main(int argc, char** argv) {
                                drive.d.pcie_experts};
             };
             const DecSnap ds0 = dec_snap();
+            peer.timing_start();   // STRATA_XTIER_TIMING=1: the AMD tier's breakdown of this request's decode
             double dt_run = 0, dt_commit = 0, dt_draft = 0;
             double dt_adapt_wait = 0, dt_adapt_join = 0;   // the tier's wait before a window / join after the draft (ms, summed)
             const int64_t dt_sw0 = ajob ? a_swapped : adapt_nswaps;
@@ -14218,6 +14313,7 @@ int main(int argc, char** argv) {
             const uint64_t file_bytes0 = src.file_read_bytes();
             const int64_t decode_look0 = drive.d.cache_hits + drive.d.cache_admitted + drive.d.cache_refused;
             const int64_t offload0 = drive.d.offload_entries;   // #588
+            const int64_t peer0 = drive.d.peer_entries;
             pcie_auto.mark(drive.d.ms_run, drive.d.multi_misses);   // the prompt's windows are not the decode's
             if (cancelled) finish = nf_hit ? "nonfinite" : "cancel";
             // ======== --pipeline-windows 2: the decode windows with the two cards overlapped ========
@@ -15228,6 +15324,7 @@ int main(int argc, char** argv) {
                     else std::fprintf(stderr, "strata decode GPU stages, stage %d (ms/window):%s\n", st, pr.c_str());
                 }
             }
+            peer.timing_print();
             if (drive.d.fs) std::fprintf(stderr, "strata serve: %s\n", drive.d.fs->report().c_str());
             if (!cancelled) {
                 // a prompt stopped halfway leaves the session somewhere between two chunks: nothing to continue from
@@ -15372,20 +15469,24 @@ int main(int argc, char** argv) {
             //      chunk=<tokens> experts_streamed=<blobs>   (key=value, last: the first chunk of the request's longest
             //      batched segment, 0 when it read none; the expert blobs its prompt read copied host -> device on
             //      every stage - not the CPU share's, the stage helper's or a --peer-device peer's)
+            //      amd_tier=<entries>   (--peer-device hip:N only: the AMD tier's part of [offloaded])
             char chain_txt[128] = "";
             if (o.lookup_chain > 0)
                 std::snprintf(chain_txt, sizeof(chain_txt), " %lld %lld %lld %lld %lld", (long long) chain_ok,
                               (long long) chain_drafts, (long long) sfx_ok, (long long) sfx_drafts, (long long) dec_windows);
+            char tier_txt[40] = "";
+            if (peer.foreign())
+                std::snprintf(tier_txt, sizeof(tier_txt), " amd_tier=%lld", (long long) (drive.d.peer_entries - peer0));
             if (yielded_at >= 0) std::printf("YIELDED %d %lld\n", yielded_slot, (long long) yielded_at);
             std::printf("DONE %lld %lld %.1f %.1f %s %lld %lld %lld %lld %lld %lld %lld %.1f %lld %lld%s chunk=%lld "
-                        "experts_streamed=%lld\n",
+                        "experts_streamed=%lld%s\n",
                         (long long) produced_n,
                         (long long) n, prompt_ms, decode_ms, finish, (long long) draft_accepted, (long long) draft_offered,
                         (long long) resume, (long long) req_hits, (long long) req_look,
                         (long long) (src.ram_reads() - ram0), (long long) (src.file_reads() - files0),
                         (double) (src.file_read_bytes() - file_bytes0) / 1e6, (long long) read_n,
                         (long long) req_offload, chain_txt, (long long) req_chunk,
-                        (long long) (sp.chain_experts_streamed() - streamed0));
+                        (long long) (sp.chain_experts_streamed() - streamed0), tier_txt);
             std::fflush(stdout);
             if (admit_slot >= 0) {   // --batch: BADM <slot> <1 = continues in the batch windows | 0 = done>
                 bool cont = !cancelled && produced_n == 1 && admit_max_new > 1 && std::strcmp(finish, "length") == 0 &&
@@ -15506,15 +15607,20 @@ int main(int argc, char** argv) {
             // to read (--pcie-frac) are in neither count - #588: so that share is said beside it (raising --pcie-frac
             // raises the hit rate while the PCIe reads may make the decode slower)
             if (req_look > 0) {
-                char off[160] = "";
-                if (req_offload > 0)
+                char off[160] = "", amd[160] = "";
+                const int64_t req_tier = peer.foreign() ? drive.d.peer_entries - peer0 : 0;   // the AMD tier's part of req_offload
+                const int64_t routed = req_look + req_offload;
+                if (req_offload - req_tier > 0)
                     std::snprintf(off, sizeof off, "; %lld more read by the GPU over PCIe or from another GPU (%.1f%% of "
-                                  "all %lld routed)", (long long) req_offload,
-                                  100.0 * (double) req_offload / (double) (req_look + req_offload),
-                                  (long long) (req_look + req_offload));
-                std::fprintf(stderr, "strata serve: decode expert cache hit rate: %.1f%% (%lld hits / %lld lookups)%s\n",
+                                  "all %lld routed)", (long long) (req_offload - req_tier),
+                                  100.0 * (double) (req_offload - req_tier) / (double) routed, (long long) routed);
+                if (peer.foreign())
+                    std::snprintf(amd, sizeof amd, "; the AMD tier computed %lld entries (%.1f%% of all %lld routed) and took in "
+                                  "%lld experts since the start", (long long) req_tier, 100.0 * (double) req_tier / (double) routed,
+                                  (long long) routed, (long long) peer.swaps());
+                std::fprintf(stderr, "strata serve: decode expert cache hit rate: %.1f%% (%lld hits / %lld lookups)%s%s\n",
                              100.0 * (double) req_hits / (double) req_look,
-                             (long long) req_hits, (long long) req_look, off);
+                             (long long) req_hits, (long long) req_look, off, amd);
             }
             if (drive.d.tail_experts > 0)   // STRATA_ROUTE_TAIL_SKIP, cumulative
                 std::fprintf(stderr, "strata serve: route tail skip: %lld missed experts skipped (%lld entries) since the "

@@ -1224,6 +1224,13 @@ __global__ void wait_handoff_kernel(const volatile uint32_t* flag, uint32_t valu
     __threadfence_system();
 }
 
+// a fence so the stream's earlier writes land first, the store, and a fence so the store leaves the card at once
+__global__ void raise_flag_kernel(uint32_t* flag, uint32_t value) {
+    __threadfence_system();
+    *(volatile uint32_t*) flag = value;
+    __threadfence_system();
+}
+
 __global__ void handoff_publish_kernel(float* dst, const float* __restrict__ a, int64_t na, const float* __restrict__ b,
                                        int64_t nb, const float* __restrict__ c, int64_t nc, uint32_t* counter,
                                        uint32_t* flag, const volatile uint32_t* drop) {
@@ -1259,6 +1266,11 @@ __global__ void wait_flag_ge_stamped_kernel(const volatile uint32_t* flag, uint3
 void wait_handoff(const uint32_t* flag, uint32_t value, uint32_t* err, unsigned long long timeout_ns, void* stream) {
     wait_handoff_kernel<<<1, 1, 0, (cudaStream_t) stream>>>(flag, value, err, timeout_ns);
     check("wait_handoff");
+}
+
+void raise_flag(uint32_t* flag, uint32_t value, void* stream) {
+    raise_flag_kernel<<<1, 1, 0, (cudaStream_t) stream>>>(flag, value);
+    check("raise_flag");
 }
 
 void handoff_publish(float* dst, const float* a, int64_t na, const float* b, int64_t nb, const float* c, int64_t nc,

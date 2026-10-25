@@ -644,6 +644,7 @@ struct ExpertDispatch {
     int64_t multi_entries = 0;     ///< routed (token, expert) entries the CPU served in verify windows
     /// Multi-GPU: the second GPU's tier.  Its experts are computed there instead of on the CPU (kind 2).
     PeerExperts* peer = nullptr;
+    bool peer_tail_skip = false;   ///< STRATA_XTIER_TAIL_SKIP: the route tail skip also runs beside an AMD tier
     int64_t peer_entries = 0;      ///< routed entries the peer served in verify windows
     /// Set when `dispatch` could not produce an answer.  The loop itself has no error channel, so this is
     /// where a source failure surfaces: the driver checks it after `session_loop` returns rather than the

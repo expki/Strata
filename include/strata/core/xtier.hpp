@@ -1,0 +1,155 @@
+// The CUDA engine's side of the AMD tier: the --peer-device hip:N value and the library that drives the card.
+#pragma once
+
+#include "strata/core/xtier_abi.hpp"
+
+#include <atomic>
+#include <cstdint>
+#include <string>
+#include <vector>
+
+namespace strata::core::xtier {
+
+// The --peer-device value: a second CUDA card (N >= 1) or an AMD card (hip:N, N >= 0), never both.
+struct PeerSpec {
+    int cuda = -1;
+    int hip = -1;
+};
+
+// Accepts "N" or "hip:N", and "0" as no peer, and says why when it refuses. The AMD and Mac engines take a card number only.
+bool parse_peer_device(const std::string& v, PeerSpec& out, std::string& err);
+
+// Where the card of hip:N is for HIP, decided once in main before the engine reads its environment from other threads.
+struct HipCard {
+    int n = -1;                 // N of hip:N
+    int open = -1;              // the HIP ordinal the library opens
+    bool engine_set = false;    // the engine set HIP_VISIBLE_DEVICES=N itself
+};
+
+// HIP hides the AMD cards CUDA_VISIBLE_DEVICES leaves out, so an unset HIP_VISIBLE_DEVICES becomes N and the card is 0 then. A set value, even an empty one, is honoured.
+HipCard claim_hip_card(int n);
+
+// STRATA_XTIER_LIB if it is set, else the library beside the engine.
+std::string library_path();
+
+// STRATA_XTIER_WAIT_MS (default 30000): how long the engine waits for the AMD tier before it fails the request.
+uint64_t wait_ms();
+
+// One function pointer per strata_xtier_* export.
+struct Api {
+    int (*abi)() = nullptr;
+    void* (*open)(int, char*, size_t) = nullptr;
+    void (*close)(void*) = nullptr;
+    int (*mem_info)(void*, uint64_t*, uint64_t*) = nullptr;
+    int (*reg)(void*, void*, uint64_t, void**) = nullptr;
+    int (*unreg)(void*, void*) = nullptr;
+    const char* (*last_error)(void*) = nullptr;
+    int (*flag_echo)(void*, const uint32_t*, uint32_t*, uint32_t*, uint32_t, uint64_t) = nullptr;
+    int (*sync)(void*) = nullptr;
+    void* (*host_alloc)(void*, uint64_t, int) = nullptr;
+    void (*host_free)(void*, void*) = nullptr;
+    int (*probe)(void*, int, void*, uint64_t, uint32_t, uint64_t*, float*) = nullptr;
+    int (*arena)(void*, const uint64_t*, int64_t, uint64_t*) = nullptr;
+    int (*fill)(void*, int64_t, const void*, uint64_t) = nullptr;
+    int (*read)(void*, int64_t, void*, uint64_t) = nullptr;
+    int (*refill_record)(void*) = nullptr;
+    int (*refill_done)(void*, int) = nullptr;
+    int (*decode)(void*, const strata_xtier_fmt*, const float*, int64_t, const strata_xtier_meta*) = nullptr;
+    int (*decode_wait)(void*, const float**, uint64_t) = nullptr;
+    int (*timing)(void*, double*) = nullptr;
+    int (*prefill_open)(void*, int64_t, int64_t, uint64_t, uint64_t) = nullptr;
+    int (*prefill_layer)(void*, const strata_xtier_prefill_args*) = nullptr;
+};
+
+// Opens the library at path, or returns null with the reason in err. Not cached and never unloaded.
+const Api* load_from(const std::string& path, std::string& err);
+
+// load_from(library_path()) once for the process.
+const Api* load(std::string& err);
+
+// One AMD card, opened through the library.
+class Device {
+public:
+    Device() = default;
+    Device(const Device&) = delete;
+    Device& operator=(const Device&) = delete;
+    ~Device();
+
+    bool open(int hip_device, std::string& err);
+    void close();
+    bool valid() const { return h_ != nullptr; }
+    bool mem_info(uint64_t& free_b, uint64_t& total_b, std::string& err);
+    // Maps engine host memory into the card's address space.
+    bool register_host(void* host, uint64_t bytes, void** hip_dev, std::string& err);
+    void unregister_host(void* host);
+    // Queues a wait for *in_hip >= seq (or the timeout, then *err_hip = 1) and then *out_hip = seq on the card, and returns at once.
+    bool flag_echo(const uint32_t* in_hip, uint32_t* out_hip, uint32_t* err_hip, uint32_t seq, uint64_t timeout_ns, std::string& err);
+    // Waits for the work queued on the card.
+    bool sync(std::string& err);
+    // Pinned host memory the card's runtime owns, mapped and portable, and coherent when asked, or null with the reason in err.
+    void* host_alloc(uint64_t bytes, std::string& err, bool coherent = false);
+    void host_free(void* host);
+    // Phase 0 probe only, and it waits: op 0 writes the seed's pattern into host, op 1 counts the wrong words, op 2 times a copy into host.
+    bool probe(int op, void* host, uint64_t bytes, uint32_t seed, uint64_t& result, float& ms, std::string& err);
+
+    // One device allocation cut into slots of these sizes, each 256 byte aligned, and each slot's address in slot_addr. Once per card.
+    bool arena(const std::vector<uint64_t>& slot_bytes, std::vector<uint64_t>& slot_addr, std::string& err);
+    // Queues a copy into a slot on the refill stream and returns at once. Until refill_done says 1, host stays valid and no decode reads the slot.
+    bool fill(int64_t slot, const void* host, uint64_t bytes, std::string& err);
+    // Copies a slot out after the queued fills and waits, for checking a fill.
+    bool read(int64_t slot, void* host, uint64_t bytes, std::string& err);
+    // Marks the fills queued so far.
+    bool refill_record(std::string& err);
+    // 1 when the fills before the last record are done, 0 when not yet, -1 on error (the reason in err when it is given). With wait it blocks.
+    int refill_done(bool wait, std::string* err = nullptr);
+    // Queues one layer's expert rows and returns at once, x and m are copied before it returns.
+    bool decode(const strata_xtier_fmt& f, const float* x, int64_t n_tok, const strata_xtier_meta& m, std::string& err);
+    // Spins for the queued decode and gives its pinned rows (m.count[1] rows of n_embd floats, valid until the next decode), or fails after STRATA_XTIER_WAIT_MS (default 30000) and the decode stays pending until a later wait or close.
+    bool decode_wait(const float** rows, std::string& err);
+    // STRATA_XTIER_TIMING=1: the card's ms in copies in, kernels and copy out summed since the last call, and the count of decodes, or -1 (also for a library without the export).
+    int timing(double ms[3]);
+    // Sizes the prompt buffers on the card for chunks of up to T_max tokens, or grows them.
+    bool prefill_open(int64_t T_max, int64_t N, uint64_t gu_max, uint64_t d_max, std::string& err);
+    // Queues one layer's prompt rows behind a.x_ready and returns at once. Any thread may call it.
+    bool prefill_layer(const strata_xtier_prefill_args& a, std::string& err);
+    // A wait for the card timed out, so it may never finish its queued work: close and SharedHost then leave the card and its memory alone.
+    void mark_hung() { hung_ = true; }
+    bool hung() const { return hung_; }
+
+private:
+    std::string text() const;
+
+    const Api* api_ = nullptr;
+    void* h_ = nullptr;
+    std::atomic<bool> hung_{false};
+};
+
+// Pinned host memory both makes map, always its own, so no expert blob is registered (their fills rely on HIP copying unpinned memory at once).
+class SharedHost {
+public:
+    SharedHost() = default;
+    SharedHost(const SharedHost&) = delete;
+    SharedHost& operator=(const SharedHost&) = delete;
+    ~SharedHost();
+
+    // Tries hipHostMalloc then cudaHostRegister (C), cudaHostAlloc then register_host (A), mmap then both registers (B). Coherent asks C for coherent memory.
+    bool alloc(Device& d, size_t bytes, std::string& err, bool coherent = false);
+    void* host() const { return host_; }
+    void* cuda_dev() const { return cdev_; }
+    void* hip_dev() const { return hdev_; }
+    // The variant that worked: 'C', 'A' or 'B', or 0 before alloc.
+    char variant() const { return kind_; }
+
+private:
+    void release();
+
+    Device* d_ = nullptr;
+    char kind_ = 0;
+    void* host_ = nullptr;
+    void* cdev_ = nullptr;
+    void* hdev_ = nullptr;
+    size_t bytes_ = 0;
+    bool cuda_reg_ = false, hip_reg_ = false;
+};
+
+}  // namespace strata::core::xtier

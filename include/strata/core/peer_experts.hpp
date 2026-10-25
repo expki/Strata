@@ -17,10 +17,13 @@
 
 #include "strata/core/expert_cache.hpp"
 #include "strata/core/expert_source.hpp"
+#include "strata/core/xtier.hpp"
 
 #include <cuda_runtime.h>
 
+#include <chrono>
 #include <cstdint>
+#include <functional>
 #include <string>
 #include <utility>
 #include <vector>
@@ -44,8 +47,16 @@ public:
     bool open(int device, const std::vector<std::pair<int32_t, int32_t>>& ranked, const ExpertCache& primary,
               ExpertSource& src, int64_t n_layers, int64_t n_expert, int reserve_mib, int64_t max_slots,
               std::string& err);
+    /// --peer-device hip:N: the same tier on an AMD card through the AMD tier library, skipping the pairs `held` says a CUDA card holds.
+    bool open_foreign(const xtier::HipCard& card, const std::vector<std::pair<int32_t, int32_t>>& ranked,
+                      const std::function<bool(int32_t, int32_t)>& held, ExpertSource& src, int64_t n_layers,
+                      int64_t n_expert, int reserve_mib, int64_t max_slots, std::string& err);
     void close();
-    bool valid() const { return device_ >= 0; }
+    bool valid() const { return device_ >= 0 || foreign(); }
+    /// The tier is an AMD card (open_foreign): its device() is -1 and its slots are addresses only the library reads.
+    bool foreign() const { return xdev_.valid(); }
+    /// The AMD card of a foreign tier, which the prompt path hands its rows to, or null.
+    xtier::Device* xdev() { return foreign() ? &xdev_ : nullptr; }
     int device() const { return device_; }
 
     /// Whether the peer holds (layer, expert) right now.
@@ -54,7 +65,8 @@ public:
     /// The device address of (layer, expert)'s blob on the peer, or null when it is not resident.
     const uint8_t* slot_ptr(int64_t layer, int64_t expert) {
         const int32_t sl = res_[(size_t) (layer * n_expert_ + expert)];
-        return sl >= 0 ? cache_.device_slot(sl) : nullptr;
+        if (sl < 0) return nullptr;
+        return foreign() ? (const uint8_t*) (uintptr_t) xslot_[(size_t) sl] : cache_.device_slot(sl);
     }
     /// Whether the primary (device 0) and the peer can read each other's memory directly (NVLink / PCIe P2P).
     bool p2p() const { return p2p_; }
@@ -68,19 +80,24 @@ public:
     bool finish(float* out, std::string& err);
 
     /// Adaptive tier: swap up to `max_swaps` experts routed at least twice that neither the primary (`res0`, slot
-    /// or -1) nor the peer holds into the peer's least-used slots.  Copies run on the peer's refill stream; a
-    /// swapped-in expert becomes resident at `apply_pending`.  Call only between verify windows.
+    /// or -1) nor the peer holds into the peer's free slots, then its least-used ones.  Copies run on the peer's
+    /// refill stream, and a swapped-in expert becomes resident at `apply_pending`.  Call only between verify windows.
     bool adapt(const float* usage, const int32_t* res0, int max_swaps, std::string& err);
     void apply_pending(bool wait);
+    /// A stage took (layer, expert): the peer stops holding it, and its slot is free for the next adapt.
+    void release(int64_t layer, int64_t expert);
 
     int64_t resident() const { return resident_; }
     /// the last launch writes its rows into the host rows itself (the caller must not touch them)
     bool launched_direct() const { return launched_direct_; }
-    double gib() const { return cache_.gib(); }
+    double gib() const { return foreign() ? (double) xbytes_ / 1073741824.0 : cache_.gib(); }
     int64_t entries() const { return entries_; }      ///< routed entries the peer computed
     int64_t experts() const { return experts_; }      ///< distinct (layer, expert) the peer computed
     int64_t swaps() const { return swaps_; }
     double ms_wait = 0;                               ///< host time spent in finish() waiting for the peer
+    /// STRATA_XTIER_TIMING=1 with an AMD tier: a request's decode breakdown starts, and prints as one line.
+    void timing_start();
+    void timing_print();
 
 private:
     int device_ = -1;
@@ -90,6 +107,7 @@ private:
     ExpertSource* src_ = nullptr;
     std::vector<int32_t> res_;                        ///< [n_layers * n_expert] -> peer slot or -1
     std::vector<std::pair<int32_t, int32_t>> pending_;   ///< (residency index, slot) once the copies land
+    std::vector<std::vector<int32_t>> free_;          ///< per layer, the slots that hold no expert
     int64_t resident_ = 0, entries_ = 0, experts_ = 0, swaps_ = 0;
     cudaStream_t stream_ = nullptr, refill_ = nullptr;
     cudaEvent_t refill_ev_ = nullptr;
@@ -103,6 +121,14 @@ private:
     std::vector<int32_t> row_of_;                     ///< compact row -> original entry
     int64_t launched_rows_ = 0;
     bool launched_direct_ = false;
+    xtier::Device xdev_;                              ///< the AMD card of a foreign tier
+    std::vector<uint64_t> xslot_;                     ///< its slots' addresses on that card
+    uint64_t xbytes_ = 0;                             ///< its slots' bytes, padded as the arena lays them out
+    strata_xtier_meta xmeta_{};                       ///< its plan, which the library copies at each decode
+    bool xtiming_ = false;                            ///< STRATA_XTIER_TIMING=1 on an AMD tier
+    double xt_[5] = {};                               ///< ms in launch, its library call, between, finish's wait, the copy out
+    int64_t xt_calls_ = 0, xt_rows_ = 0, xt_groups_ = 0;
+    std::chrono::steady_clock::time_point xt_end_{};  ///< when the last launch returned
 };
 
 }  // namespace strata::core

@@ -1348,7 +1348,7 @@ class StrataEngine:
             self.last.update(offloaded=int(f[15]))
         for tok in f[16:]:                                # key=value fields after the positional ones (the prompt's
             key, eq, value = tok.partition("=")           # first chunk and its streamed expert blobs)
-            if eq and key in ("chunk", "experts_streamed"):
+            if eq and key in ("chunk", "experts_streamed", "amd_tier"):   # amd_tier: --peer-device hip:N only
                 try:
                     self.last[key] = int(value)
                 except ValueError:
@@ -3052,10 +3052,17 @@ def apply_ready_timeout(cfg: dict) -> None:
     ENGINE_READY_S = float(v)
 
 
+def cuda_peer(cfg: dict) -> bool:
+    """Whether --peer-device takes a later CUDA card (N), not an AMD card beside the layer split (hip:N)."""
+    args = cfg.get("args") or []
+    return any(a == "--peer-device" and not str(args[i + 1] if i + 1 < len(args) else "").startswith("hip:")
+               for i, a in enumerate(args))
+
+
 def layer_split_of(cfg: dict) -> bool:
     """Several GPUs in the config are a layer split, unless the args put the later card(s) to another use: with
-    --peer-device the second card is an expert-cache tier, and the engine refuses that beside --layer-split (#665)."""
-    return len(gpu_list(cfg)) > 1 and "--peer-device" not in cfg["args"]
+    --peer-device N the second card is an expert-cache tier, and the engine refuses that beside --layer-split (#665)."""
+    return len(gpu_list(cfg)) > 1 and not cuda_peer(cfg)
 
 
 _CARD_CLASS: list = []
@@ -3357,7 +3364,7 @@ def ordered_gpus(cfg: dict, scores=None, vrams=None, archs=None) -> list[int]:
     if len(gl) < 2 or cfg.get("gpu_order") == "as_given" or gpu_roles_active(cfg):
         return gl
     args = cfg.get("args") or []
-    if "--peer-device" in args or "--layer-split" in args or layer_split_value(cfg) != "auto":
+    if cuda_peer(cfg) or "--layer-split" in args or layer_split_value(cfg) != "auto":
         return gl
     hip = cfg.get("backend") == "hip"
     if hip:
@@ -5499,8 +5506,10 @@ class Service:
                             # #588: the share the GPU read over PCIe (--pcie-frac) or another GPU computed - not in
                             # the hit rate's lookups, which is the VRAM share of the rest (None: an older engine)
                             routed = (last.get("lookups") or 0) + (last.get("offloaded") or 0)
-                            pcie_share = round(last["offloaded"] / routed, 3) \
+                            tier = last.get("amd_tier")   # the AMD tier's entries are in offloaded too
+                            pcie_share = round((last["offloaded"] - (tier or 0)) / routed, 3) \
                                 if last.get("offloaded") is not None and routed else None
+                            tier_share = round(tier / routed, 3) if tier is not None and routed else None
                             seen = prompt_tokens_seen(len(ids), last)   # #471: < len(ids) when cancelled mid-read
                             self.history.append({
                                 "id": request_id,
@@ -5518,6 +5527,7 @@ class Service:
                                 "decode_tok_s": round(last["generated"] / (last["decode_ms"] / 1000), 1)
                                 if n and last.get("generated") and last.get("decode_ms") else None,
                                 "hit_rate": hit_rate, "pcie_share": pcie_share, "ram_blobs": last.get("ram_blobs"),
+                                **({"amd_tier_share": tier_share} if tier_share is not None else {}),
                                 "file_blobs": last.get("file_blobs"), "file_mb": last.get("file_mb"),
                                 # #457: the speculative drafts from the DONE line (None: the engine did not say)
                                 "drafts_offered": last.get("drafts_offered"),
@@ -5544,8 +5554,12 @@ class Service:
                             ft = st.get("first_token")
                             rate = answer_speed(last, n, now - ft if ft else None)
                             hit_msg = f", expert cache {hit_rate*100:.1f}% hit" if hit_rate is not None else ""
-                            if hit_msg and pcie_share:
-                                hit_msg += f" (+{pcie_share*100:.1f}% of the routed experts over PCIe)"
+                            shares = [f"+{pcie_share*100:.1f}% of the routed experts over PCIe"] if pcie_share else []
+                            if tier_share:   # --peer-device hip:N: the AMD tier's part, named once
+                                where = "on the AMD tier" if shares else "of the routed experts on the AMD tier"
+                                shares.append(f"+{tier_share*100:.1f}% {where}")
+                            if hit_msg and shares:
+                                hit_msg += f" ({', '.join(shares)})"
                             rate_txt = f"{rate:.1f} tok/s" if rate is not None else "no speed"
                             print(f"[strata] done: {n} tokens in {el:.0f} s ({rate_txt}) "
                                   f"({finish}, cancel={cancel.is_set()}){hit_msg}", flush=True)
@@ -5692,7 +5706,8 @@ def request_stats(segments: list[dict]) -> dict:
         else:
             result.pop(key, None)
     for key in ("prompt_ms", "decode_ms", "generated", "drafts_offered", "drafts_accepted",
-                "hits", "lookups", "offloaded", "ram_blobs", "file_blobs", "file_mb", "experts_streamed"):
+                "hits", "lookups", "offloaded", "ram_blobs", "file_blobs", "file_mb", "experts_streamed",
+                "amd_tier"):
         if any(segment.get(key) is not None for segment in segments):
             result[key] = sum(segment.get(key) or 0 for segment in segments)
     return result
