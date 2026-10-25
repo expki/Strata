@@ -8935,7 +8935,14 @@ int main(int argc, char** argv) {
         } else if (peer.foreign()) {   // every stage hands it the rows of the experts it holds
             std::vector<std::pair<strata::prefill::Prefill*, int>> paths{{&sp, primary_device}};
             for (const auto& st : stages) paths.emplace_back(&st->sp, st->dev);
+            // STRATA_XTIER_PF_STAGES=digits (a test): only the listed stages, 0 the first, hand the tier prompt rows
+            const char* pf_stages = std::getenv("STRATA_XTIER_PF_STAGES");
             for (size_t i = 0; i < paths.size(); ++i) {
+                if (pf_stages != nullptr && std::strchr(pf_stages, (char) ('0' + i)) == nullptr) {
+                    std::fprintf(stderr, "strata serve: stage %zu reads its prompts without the AMD tier (STRATA_XTIER_PF_STAGES=%s)\n",
+                                 i, pf_stages);
+                    continue;
+                }
                 const strata::core::OnDevice on(paths[i].second);
                 if (!paths[i].first->set_peer(&peer, 0, err)) {
                     std::fprintf(stderr, "strata serve: %s - stage %zu reads its prompts without the AMD tier\n", err.c_str(), i);

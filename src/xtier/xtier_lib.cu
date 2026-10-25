@@ -7,6 +7,7 @@
 
 #include <hip/hip_runtime.h>
 
+#include <algorithm>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -57,6 +58,17 @@ struct Prompt : PromptBufs {
     uint64_t calls = 0;
     int fit_gu = -1, fit_d = -1;              // the type pair MMQ was last found to fit
     std::unique_ptr<strata::prefill::mmq::Context> ctx;
+    // STRATA_XTIER_TIMING=1: events around each prompt layer, summed once they have run
+    struct Tm {
+        hipEvent_t e[5] = {};                 // start, x seen, inputs in, kernels done, sums out
+        double host = 0, lock = 0, slot = 0;  // host ms in the call, waiting for pf_mu, waiting for a staging slot
+        int64_t rows = 0, experts = 0;
+    };
+    std::vector<Tm> tq, tfree;                // in flight oldest first, and spare event sets
+    Tm tlast;                                 // the last summed layer, kept for the card's idle gap before the next
+    bool thave = false;
+    double tms[5] = {}, thost = 0, tlock = 0, tslot = 0;
+    int64_t trows = 0, texp = 0, tn = 0;
 };
 
 // The ints of a call's tables: pair and src, the bounds, and the adds of at most 3 per row plus one per group.
@@ -442,8 +454,37 @@ int pf_fail(std::string& why, const char* what, hipError_t e) {
     return (int) e;
 }
 
+// STRATA_XTIER_TIMING=1: sums the prompt layers whose events have run, and prints the means every 45 layers.
+void pf_harvest(Prompt& p) {
+    float ms = 0;
+    while (!p.tq.empty() && hipEventQuery(p.tq.front().e[4]) == hipSuccess) {
+        Prompt::Tm m = p.tq.front();
+        p.tq.erase(p.tq.begin());
+        for (int i = 0; i < 4; ++i)
+            if (hipEventElapsedTime(&ms, m.e[i], m.e[i + 1]) == hipSuccess) p.tms[i + 1] += ms;
+        if (p.thave && hipEventElapsedTime(&ms, p.tlast.e[4], m.e[0]) == hipSuccess) p.tms[0] += ms;
+        if (p.thave) p.tfree.push_back(p.tlast);
+        p.tlast = m;
+        p.thave = true;
+        p.thost += m.host;
+        p.tlock += m.lock;
+        p.tslot += m.slot;
+        p.trows += m.rows;
+        p.texp += m.experts;
+        if (++p.tn < 45) continue;
+        const double n = (double) p.tn;
+        std::fprintf(stderr, "strata xtier prompt timing: %lld layers, %.0f rows and %.1f experts each; ms per layer: card idle %.2f, "
+                             "waits for x %.2f, in %.2f, kernels %.2f, out %.2f; host in the call %.2f (pf_mu %.2f, slot %.2f)\n",
+                     (long long) p.tn, p.trows / n, p.texp / n, p.tms[0] / n, p.tms[1] / n, p.tms[2] / n, p.tms[3] / n,
+                     p.tms[4] / n, p.thost / n, p.tlock / n, p.tslot / n);
+        std::fill(p.tms, p.tms + 5, 0.0);
+        p.thost = p.tlock = p.tslot = 0;
+        p.trows = p.texp = p.tn = 0;
+    }
+}
+
 // Queues one layer's prompt rows on the prompt stream, with pf_mu held: prefill.cpp's compact SUMS route, the peer's half.
-int prefill_enqueue(Tier* t, const strata_xtier_prefill_args* a, std::string& why) {
+int prefill_enqueue(Tier* t, const strata_xtier_prefill_args* a, std::string& why, Prompt::Tm* tm) {
     (void) hipGetLastError();
     hipError_t e = hipSetDevice(t->device);
     if (e != hipSuccess) return pf_fail(why, "hipSetDevice", e);
@@ -455,7 +496,10 @@ int prefill_enqueue(Tier* t, const strata_xtier_prefill_args* a, std::string& wh
     const int64_t T = a->T, N = a->N, n = a->n_experts, rows = a->rows_peer;
     // the tables go up from a pinned slot, free again once the upload of the call that used it last has run
     const int slot = (int) (p.calls % kPfSlots);
+    const auto ts0 = std::chrono::steady_clock::now();
     if ((e = hipEventSynchronize(p.staged[slot])) != hipSuccess) return pf_fail(why, "staging", e);
+    if (tm) tm->slot = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - ts0).count();
+    if (tm) hipEventRecord(tm->e[0], s);
     int32_t* st = p.stage[slot];
     size_t at = 0;
     const std::pair<const int32_t*, int64_t> parts[] = {{a->pair, rows}, {a->src, rows}, {a->bounds, a->n_bounds}, {a->adds, a->n_adds}};
@@ -465,6 +509,7 @@ int prefill_enqueue(Tier* t, const strata_xtier_prefill_args* a, std::string& wh
     }
     const int32_t *d_pair = p.tab, *d_src = p.tab + rows, *d_bounds = d_src + rows, *d_adds = d_bounds + a->n_bounds;
     k::wait_handoff(a->x_ready, a->seq, a->wait_err, a->timeout_ns, s);
+    if (tm) hipEventRecord(tm->e[1], s);
     if (a->f16) pk::f16_to_f32_wide(p.x, (const uint16_t*) a->x_hip, T * N, s);
     else pk::copy_f32_wide(p.x, (const float*) a->x_hip, T * N, s);
     pk::copy_f32_wide(p.w, a->w_hip, T * a->K, s);
@@ -472,6 +517,7 @@ int prefill_enqueue(Tier* t, const strata_xtier_prefill_args* a, std::string& wh
     if ((e = hipEventRecord(p.staged[slot], s)) != hipSuccess) return pf_fail(why, "hipEventRecord", e);
     ++p.calls;
     if ((e = hipMemsetAsync(p.sum, 0, (size_t) (T * N) * 4, s)) != hipSuccess) return pf_fail(why, "hipMemsetAsync", e);
+    if (tm) hipEventRecord(tm->e[2], s);
     const strata_xtier_fmt& f = a->fmt;
     const size_t gub = a->gu_bytes, db = a->d_bytes;
     for (int64_t g = 0; g < a->n_groups; ++g) {
@@ -507,6 +553,7 @@ int prefill_enqueue(Tier* t, const strata_xtier_prefill_args* a, std::string& wh
         const int64_t nt = a->group_ntok[g];
         pk::peer_gather_add(p.sum, p.dm, r0, p.w, d_pair, ad, ad + nt, ad + 2 * nt + 1, nt, s);
     }
+    if (tm) hipEventRecord(tm->e[3], s);
     if (a->f16) {
         pk::sums_to_f16(p.sum, p.sum16, T * N, s);
         e = hipMemcpyAsync(a->sum_host, p.sum16, (size_t) (T * N) * 2, hipMemcpyDeviceToHost, s);
@@ -515,6 +562,11 @@ int prefill_enqueue(Tier* t, const strata_xtier_prefill_args* a, std::string& wh
     }
     if (e != hipSuccess) return pf_fail(why, "sums", e);
     if (t->pf_drop == 0 || p.calls != t->pf_drop) k::raise_flag(a->done, a->seq, s);
+    if (tm) {
+        hipEventRecord(tm->e[4], s);
+        tm->rows = rows;
+        tm->experts = n;
+    }
     // the card idles between prompt layers: a 16K prompt without this ran 70 of its 122 busy samples at the 500 MHz idle clock
     if (t->keepwarm && hipEventRecord(p.done, s) == hipSuccess) {
         std::unique_lock<std::mutex> lk(t->mu, std::try_to_lock);   // the decode lock may be held across a card wait: then no spin this time
@@ -948,8 +1000,30 @@ STRATA_XTIER_EXPORT int strata_xtier_prefill_layer(void* h, const strata_xtier_p
     std::string why;
     int r = -1;
     try {
+        const auto t0 = std::chrono::steady_clock::now();
         const std::lock_guard<std::mutex> lk(t->pf_mu);
-        r = prefill_enqueue(t, a, why);
+        const auto t1 = std::chrono::steady_clock::now();
+        Prompt& p = t->pf;
+        Prompt::Tm tm;
+        bool timed = false;
+        if (t->timing) {   // STRATA_XTIER_TIMING=1: this layer's events, from a spare set or new ones
+            if (!p.tfree.empty()) {
+                tm = p.tfree.back();
+                p.tfree.pop_back();
+                timed = true;
+            } else {
+                timed = true;
+                for (hipEvent_t& ev : tm.e) timed = timed && hipEventCreate(&ev) == hipSuccess;
+            }
+        }
+        r = prefill_enqueue(t, a, why, timed ? &tm : nullptr);
+        if (timed && r == 0) {
+            using ms = std::chrono::duration<double, std::milli>;
+            tm.lock = ms(t1 - t0).count();
+            tm.host = ms(std::chrono::steady_clock::now() - t0).count();
+            p.tq.push_back(tm);
+            pf_harvest(p);
+        }
     } catch (const std::exception& ex) {
         why = std::string("prefill_layer: ") + ex.what();
     }

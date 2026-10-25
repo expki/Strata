@@ -59,6 +59,7 @@
 #include <atomic>
 #include <condition_variable>
 #include <cstring>
+#include <functional>
 #include <future>
 #include <memory>
 #include <mutex>
@@ -2795,6 +2796,10 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
     // The direct successor's future lives on the Prefill object. Intermediate
     // stages therefore do not drain the complete remaining GPU chain here.
     double host_sync_ms = 0, host_chunk_ms = 0, host_setup_ms = 0;   // STRATA_PREFILL_TIMING: the host's share
+    double hl_sync = 0, hl_group = 0, hl_amd = 0, hl_own = 0;         // STRATA_PREFILL_TIMING: a MoE layer's host steps (ms)
+    int64_t hl_n = 0;
+    using hl_clock = std::chrono::steady_clock;
+    hl_clock::time_point hl_t{};
     strata::kernels::QsaShapes s = core::qsa_shapes(g);
     // read once (STRATA_KV_PREFETCH=1/0: the next streamed layer's KV prefix is staged on its own stream)
     static const bool kv_prefetch_on = [] {
@@ -3987,7 +3992,13 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                         // work), not the host: the watchdog's report says so (only its text changes)
                         core::progress_at("reading the prompt (batched): waiting for the GPU (attention, router) at layer",
                                           l, p0);
+                        if (pt.on) hl_t = hl_clock::now();
                         cudaStreamSynchronize(m.cs);
+                        if (pt.on) {
+                            hl_sync += std::chrono::duration<double, std::milli>(hl_clock::now() - hl_t).count();
+                            hl_t = hl_clock::now();
+                            ++hl_n;
+                        }
                         if (amd_late()) return false;
                         core::progress_at("reading the prompt (batched): layer", l, p0);
                         if (on_routes) on_routes(l, ids_h, T * K);   // 149-prefetch: the RAM policy's prompt seed
@@ -4109,6 +4120,19 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                                 if (rows_peer + c > m.pp->cap_rows) { ++m.pp->over_cap; continue; }
                                 on_peer[(size_t) e] = 1;
                                 rows_peer += c;
+                            }
+                            // STRATA_XTIER_PF_SHARE=f (a test): the AMD tier keeps at most f of the rows, the GPU streams its busiest experts
+                            static const double pf_share = [] { const char* v = std::getenv("STRATA_XTIER_PF_SHARE"); return v ? std::atof(v) : 1.0; }();
+                            if (m.pp->foreign && pf_share < 1.0) {
+                                std::vector<std::pair<int32_t, int32_t>> big;   // (rows, expert) of the tier's experts
+                                for (int32_t e = 0; e < m.g->n_expert; ++e)
+                                    if (on_peer[(size_t) e] == 1) big.emplace_back(m.cnt[(size_t) e], e);
+                                std::sort(big.begin(), big.end(), std::greater<>());
+                                const int64_t cap = (int64_t) (pf_share * (double) (T * K));
+                                for (size_t i = 0; i < big.size() && rows_peer > cap; ++i) {
+                                    on_peer[(size_t) big[i].second] = 0;
+                                    rows_peer -= big[i].first;
+                                }
                             }
                             rows_local = T * K - rows_peer;
                         }
@@ -4270,6 +4294,10 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                         const size_t mmq_gub = use_mmq ? mmq::matrix_bytes(mmq_gt, 1280, N) : 0;
                         const size_t mmq_db = use_mmq ? mmq::matrix_bytes(mmq_dt, N, 640) : 0;
                         pt.mark(kPfGather, cs);
+                        if (pt.on) {
+                            hl_group += std::chrono::duration<double, std::milli>(hl_clock::now() - hl_t).count();
+                            hl_t = hl_clock::now();
+                        }
                         // the routed experts' input: `mixed`, or (APR) its rotated copy, which the peer / the layer
                         // split's helper also take (one rotation for both cards; `mixed` itself feeds the shared expert)
                         const float* xsrc = m.mixed;
@@ -4327,9 +4355,11 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                             else cudaMemcpyAsync(P.xx.host(), m.mixed, (size_t) T * N * 4, cudaMemcpyDeviceToHost, P.x_stream);
                             cudaMemcpyAsync(P.xw.host(), m.w, (size_t) T * K * 4, cudaMemcpyDeviceToHost, P.x_stream);
                             strata::kernels::raise_flag((uint32_t*) P.xflags.cuda_dev() + kXReady, ++P.seq, P.x_stream);
+                            const hl_clock::time_point ha = hl_clock::now();
                             if (!queue_amd_layer(P, l, T, slot_h, src_h, rows_local, rows_peer, order_peer, m.cnt, m.off, mmq_gt,
                                                  mmq_dt, mmq_gub, mmq_db, err))
                                 return false;
+                            if (pt.on) hl_amd += std::chrono::duration<double, std::milli>(hl_clock::now() - ha).count();
                         } else if (peer_now) {
                             PeerPrefill& P = *m.pp;
                             // the host route's copies beside the compute stream: the primary's own experts start at once
@@ -4920,6 +4950,10 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                         }
                     }
                     pt.mark(kPfCombine, cs);
+                    if (pt.on && hl_t != hl_clock::time_point{}) {
+                        hl_own += std::chrono::duration<double, std::milli>(hl_clock::now() - hl_t).count();
+                        hl_t = {};
+                    }
                     if (cpu_fut.valid()) {   // set_cpu_pool: the CPU's rows into Dm's tail, row_sd 1 (s_down is in them)
                         if (cpu_share_env() < 0.0) cudaEventRecord(m.cpu_ev[1], m.cs);   // after the GPU's expert work
                         if (!cpu_fut.get()) { err = "prefill: a CPU expert has no blob"; return false; }
@@ -5241,6 +5275,10 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
         std::fprintf(stderr, "strata prefill timing: host: chunk setup (PLE rows, the expert stream plan) %.0f ms, "
                              "waiting for each chunk %.0f ms, after each chunk (the draft layer, progress) %.0f ms, "
                              "PLE %.0f ms\n", host_setup_ms, host_sync_ms, host_chunk_ms, stats_.ms_ple);
+        if (hl_n > 0)
+            std::fprintf(stderr, "strata prefill timing: host per MoE layer (%lld): router sync %.2f, grouping %.2f, AMD call %.2f, "
+                                 "gather to combine (AMD call included) %.2f ms\n", (long long) hl_n, hl_sync / hl_n,
+                         hl_group / hl_n, hl_amd / hl_n, hl_own / hl_n);
         if (pe.on) {
             int pd = 0; cudaGetDevice(&pd); cudaSetDevice(pe.dev); cudaStreamSynchronize(m.pp->s); pe.fold(); cudaSetDevice(pd);
             std::string pl;
