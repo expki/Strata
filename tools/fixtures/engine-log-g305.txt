@@ -1,0 +1,11 @@
+[strata] 2026-10-27 01:25:23 engine started: /home/vdh/source/strata-base/build-cuda/strata --serve --pack /home/vdh/source/Strata-data/packs/swift-q6_k --native /opt/models/ukisai_Swift-1.5-Qwen3.8-Flash-Next-Q6_K-00001-of-00005.gguf --ple-gguf /opt/models/ukisai_Swift-1.5-Qwen3.8-Flash-Next-Q6_K-00002-of-00005.gguf --expert-profile /home/vdh/source/strata-base/data/expert-profile.bin --mmap-experts --expert-cache auto --prefill 4096 --spec 4 --spec-min-p 0.5 --mtp /home/vdh/source/Strata-data/mtp/rt --max-context 262144 --kv int8 --pool-workers 15 --conversation-cache-mib 0 --peer-device hip:0 --expert-gib hip0=30.5
+strata generate: expert cache auto: 13.70 GiB free, 700 MiB reserved (+218 MiB for the draft head) -> 3103 slots
+strata generate: expert cache 3103 slots, 12.80 GiB of VRAM; policy is
+strata generate: AMD tier on HIP device 0: 7394 experts, 30.50 GiB (filled in 7.9 s); with the NVIDIA cards' 3103 that is 10497 of 24576 on the GPUs
+strata serve: the prompt path borrows 506 CUDA0 cache slots (2.09 GiB)
+prefill: the GGUF experts are 100% in the page cache; the stager takes the RAM profile
+strata prefill: the AMD tier computes its experts' rows of each prompt chunk (up to 4096 tokens, through mapped host memory in FP16, one weighted sum per token back)
+strata serve: 433 MiB of VRAM free with everything loaded
+strata serve: WARNING: only 433 MiB of VRAM free at the start of this request (below 512 MiB): when the card is this full the driver can page GPU memory to system RAM, decode falls to a few tok/s and a window may never finish (#2065). Add --vram-reserve-mib 832 to the config's args, or lower --max-context / --batch
+strata prefill: CUDA device 0 may stream experts from RAM to the AMD tier: 128 of them a layer through a staging ring of 1082 MiB, 128 at a time on the card, its slots 0 to 127 of the 128 its ring holds for 1 stages, by its 14079 of their 14079 RAM experts (opened in 470 ms)
+strata serve: WARNING: only 303 MiB of VRAM free at the start of this request (below 512 MiB): when the card is this full the driver can page GPU memory to system RAM, decode falls to a few tok/s and a window may never finish (#2065). Add --vram-reserve-mib 960 to the config's args, or lower --max-context / --batch

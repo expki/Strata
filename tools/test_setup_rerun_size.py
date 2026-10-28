@@ -80,9 +80,9 @@ class RerunKeepsSize(unittest.TestCase):
 
 
 class RerunKeepsOwnEnv(unittest.TestCase):
-    """0.1.44 put STRATA_MMQ_KQ / STRATA_HC_Q8 / STRATA_ROUTE_TAIL_SKIP into SETUP_ENV (the entries setup writes, which a
-    setup run again does not carry over): a GSQ-RCO config of the user's own STRATA_ROUTE_TAIL_SKIP=0 was dropped with them.
-    Those three are setup's only in an Unsloth config."""
+    """0.1.44 put STRATA_MMQ_KQ / STRATA_HC_Q8 into SETUP_ENV (the entries setup writes, which a setup run again does not
+    carry over).  Those two are setup's only in an Unsloth config.  STRATA_ROUTE_TAIL_SKIP is dropped from every config:
+    the engine removed the switch."""
 
     OLD = {"env": {"STRATA_ROUTE_TAIL_SKIP": "0", "STRATA_MMQ_KQ": "1", "STRATA_HC_Q8": "0", "STRATA_RESIDENT_PIN": "0",
                    "MY_VAR": "1"}}
@@ -90,8 +90,8 @@ class RerunKeepsOwnEnv(unittest.TestCase):
     def test_a_gsq_rco_config_keeps_the_users_values(self):
         new = {"model_name": "qwen3.8-flash-next-iq3_xxs"}
         kept = setup.carry_over(dict(self.OLD), new)
-        self.assertEqual(new["env"], {"STRATA_ROUTE_TAIL_SKIP": "0", "STRATA_MMQ_KQ": "1", "STRATA_HC_Q8": "0", "MY_VAR": "1"})
-        self.assertIn("env STRATA_ROUTE_TAIL_SKIP", kept)
+        self.assertEqual(new["env"], {"STRATA_MMQ_KQ": "1", "STRATA_HC_Q8": "0", "MY_VAR": "1"})
+        self.assertNotIn("env STRATA_ROUTE_TAIL_SKIP", kept)          # a removed switch is not carried over
         self.assertNotIn("env STRATA_RESIDENT_PIN", kept)             # the older entries stay setup's own
 
     def test_an_unsloth_config_gets_setups_values_not_the_old_ones(self):

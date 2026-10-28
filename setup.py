@@ -3821,7 +3821,7 @@ def unsloth_default_env(family: str, model: str, hip: bool, in_budget: bool) -> 
     STRATA_MMQ_KQ=1 (the K-quant MMQ prompt kernels) for UD-Q5_K_XL and UD-Q6_K_XL, where its prompt-path KL is equal
     or better than the FP16 path's; UD-Q4_K_XL keeps it opt-in.  STRATA_HC_Q8=1 on CUDA for the UD-* files (the
     GGUF's own Q8_0 hyper-connection projections, closer to the file and faster; the GSQ-RCO packs are untouched).
-    STRATA_ROUTE_TAIL_SKIP=0 where every expert is in RAM (the skip costs KL there); the RAM-budget mode keeps it."""
+    The engine has no route tail skip any more, so setup writes no STRATA_ROUTE_TAIL_SKIP."""
     env = {}
     if family != "unsloth":
         return env
@@ -3829,8 +3829,6 @@ def unsloth_default_env(family: str, model: str, hip: bool, in_budget: bool) -> 
         env["STRATA_MMQ_KQ"] = "1"
     if not hip and model.startswith("UD-"):
         env["STRATA_HC_Q8"] = "1"
-    if not in_budget:
-        env["STRATA_ROUTE_TAIL_SKIP"] = "0"
     return env
 
 
@@ -6353,10 +6351,10 @@ SETUP_KEYS = frozenset({"exe", "args", "cwd", "tokenizer", "model_name", "log", 
                         "gpu", "gpus_asked", "layer_split", "host", "api_key", "draft_vocab", "vision", "args_written"})
 SETUP_ENV = frozenset({"STRATA_HIPBLASLT_TUNING", "STRATA_ROCBLAS_TUNING", "STRATA_RESIDENT_PIN", "STRATA_NO_ARENA_THP", "STRATA_MMQ_KQ", "STRATA_HC_Q8",
                        "STRATA_ROUTE_TAIL_SKIP"}) | frozenset(GFX1103_SWITCHES) | frozenset(GFX1150_SWITCHES)   # the "env" entries setup writes (the gfx1103 switches are setup's too: a re-run refreshes them, they do not linger)
-# 0.1.44 added these three, written for Unsloth's files only (unsloth_default_env).  In any other model's config they are the
-# user's own (STRATA_ROUTE_TAIL_SKIP=0 to turn the tail skip off, STRATA_MMQ_KQ=1 ...): a setup run again keeps them there
-# (0.1.44 dropped them with the rest of SETUP_ENV).
-SETUP_ENV_UNSLOTH = frozenset({"STRATA_MMQ_KQ", "STRATA_HC_Q8", "STRATA_ROUTE_TAIL_SKIP"})
+# 0.1.44 added these two, written for Unsloth's files only (unsloth_default_env).  In any other model's config they are the
+# user's own (STRATA_MMQ_KQ=1 ...): a setup run again keeps them there (0.1.44 dropped them with the rest of SETUP_ENV).
+# STRATA_ROUTE_TAIL_SKIP stays in SETUP_ENV only, so a setup run again drops it from every config (the engine removed the switch).
+SETUP_ENV_UNSLOTH = frozenset({"STRATA_MMQ_KQ", "STRATA_HC_Q8"})
 SETUP_VISION = frozenset({"exe", "cpu_exe", "mmproj", "model", "gpu", "max_tokens", "threads"})
 
 

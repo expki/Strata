@@ -207,6 +207,10 @@ public:
     ExpertPool& operator=(const ExpertPool&) = delete;
 
     int workers() const { return n_; }
+    /// The workers that take part in the batches (workers() unless set_active parked some)
+    int active_workers() const { return active_.load(std::memory_order_relaxed); }
+    /// Parks the workers above the first n (1 to workers()) from the host thread between batches, false under the NUMA split
+    bool set_active(int n);
     /// What bounded the default worker count (pool_plan.hpp; "" when a count was configured), the physical cores
     /// and logical processors counted - for the start-up line.
     const char* plan_limit() const { return plan_limit_; }
@@ -246,12 +250,18 @@ public:
     /// Plan v0.3 P6: `run_split` for multi-token jobs (at most `kMaxSplitMulti`); the rows of each expert are
     /// read once for all of its tokens.
     void run_split_multi(ExpertJobMulti* jobs, int n);
-    /// Plan v0.3 P6: the same for a native pack's layer (ggml-cpu arithmetic, `nact` activations).
+    /// The same for a native pack's layer (ggml-cpu arithmetic, `nact` activations): one batch, an expert's down rows start once its gate/up rows are done
     void run_split_multi_native(const NativeFmt& f, ExpertJobMulti* jobs, int n,
                                 NativeArithmetic arithmetic = NativeArithmetic::Default);
     static constexpr int kMaxSplitMulti = 96;
-    /// run_split_multi's phases, accumulated ms: gate/up rows, the intermediate quantization, down rows.
+    /// Batches published so far (each one bumps the epoch once).
+    uint32_t batches() const { return epoch_.load(std::memory_order_relaxed); }
+    /// Task j of T in a one-batch layer of nb experts of `per` rows: `rows` rows from row r0 of expert e, on across experts
+    struct NativeTask { int e = 0, r0 = 0; int64_t rows = 0; };
+    static NativeTask native_task(int j, int T, int nb, int per, bool even);
+    /// The phases' ms: gate/up, quantization, down (a one-batch native layer counts all of it in ms_multi_gu)
     double ms_multi_gu = 0, ms_multi_q = 0, ms_multi_down = 0;
+    bool one_batch() const { return one_batch_ && numa_n_ == 0; }
     int64_t multi_bytes = 0;
 
     /// Total `_mm_pause` iterations spent waiting, over all workers, is no longer counted - see the note on the
@@ -301,6 +311,7 @@ private:
     void publish();
 
     int n_ = 0;
+    std::atomic<int> active_{0};   ///< the workers below this id take part
     bool explicit_cores_ = false;
     bool pinned_ = true;
     std::vector<LogicalCpuInfo> layout_;   // the logical processors and their cores, read when the pool was built (the caller may be pinned later)
@@ -331,7 +342,7 @@ private:
     // - so it is deleted rather than amortised.  `alignas(64)` then stops the remaining four sharing.
     // issue #31 diagnostics: each worker's state (kParked, kSleeping, kBetween, or the job it runs) and the host's
     // (kIdle, kWaitParked, kWaitDone, or its job), printed by the serve watchdog through `diag`
-    static constexpr int32_t kParked = -1, kSleeping = -2, kBetween = -3, kIdle = -10, kWaitParked = -11,
+    static constexpr int32_t kParked = -1, kSleeping = -2, kBetween = -3, kRetired = -4, kIdle = -10, kWaitParked = -11,
                              kWaitDone = -12;
     std::unique_ptr<std::atomic<int32_t>[]> wstate_;
     std::atomic<int32_t> hstate_{kIdle};
@@ -346,6 +357,9 @@ private:
     alignas(64) std::atomic<uint32_t> sleepers_{0};
     std::mutex sleep_mu_;
     std::condition_variable sleep_cv_;
+    // a parked worker waits here so that publish() does not wake it for every batch
+    std::mutex retire_mu_;
+    std::condition_variable retire_cv_;
     std::chrono::microseconds spin_before_sleep_{kSpinBeforeSleep};
     std::vector<std::thread> threads_;
     std::vector<ExpertScratch> scratch_;   // one per worker: no allocation, no false sharing of the hot data
@@ -369,6 +383,21 @@ private:
     const NativeFmt* nfmt_ = nullptr;
     NativeArithmetic narithmetic_ = NativeArithmetic::Default;
     std::vector<SplitBufMulti> split_multi_;
+    // mode 7 (one batch a layer): gate/up tasks, then down tasks that each wait only for their own experts' h
+    int gu_tasks_ = 0;
+    bool one_batch_ = true;                             // STRATA_POOL_ONE_BATCH=0: the two phases of before
+    bool even_ = true;                                  // STRATA_POOL_EVEN=0: each task a part of one expert, interleaved
+    int mnb_ = 0;                                       // experts in the batch
+    std::unique_ptr<std::atomic<int32_t>[]> gu_rows_;   // per expert: gate/up rows finished
+    std::unique_ptr<std::atomic<int32_t>[]> h_ready_;   // per expert: 1 once its h is quantized
+    /// Gate/up rows [r0, r1) of expert e of the current native batch, into its ff rows.
+    void native_gu_part(int e, int r0, int r1);
+    /// Down rows [r0, r1) of expert e of the current native batch, from its quantized h.
+    void native_down_part(int e, int r0, int r1);
+    /// Expert e's h for every token, quantized from its finished ff rows (the down rows' activation).
+    void native_quant_part(int e);
+    /// Spins until expert e's h is ready, bounded by `kStall` like the host's waits.
+    void wait_h_ready(int e) const;
     // STRATA_NUMA_SPLIT=1 (opt-in, Linux, exactly 2 nodes): in the native row phases (modes 5/6) every expert's rows
     // are cut into one slice per NUMA node (slice k = rows [per*k/2, per*(k+1)/2) of the gate/up or down matrix, the
     // part the resident complement places on node k in step B), and each node's threads claim and count on their own

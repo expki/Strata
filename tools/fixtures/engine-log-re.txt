@@ -1,0 +1,20 @@
+[strata] 2026-10-27 03:05:30 engine started: /home/vdh/source/strata-base/build-cuda/strata --serve --pack /home/vdh/source/Strata-data/packs/swift-q6_k --native /opt/models/ukisai_Swift-1.5-Qwen3.8-Flash-Next-Q6_K-00001-of-00005.gguf --ple-gguf /opt/models/ukisai_Swift-1.5-Qwen3.8-Flash-Next-Q6_K-00002-of-00005.gguf --expert-profile /home/vdh/source/strata-base/data/expert-profile.bin --mmap-experts --expert-cache auto --prefill 4096 --spec 4 --spec-min-p 0.5 --mtp /home/vdh/source/Strata-data/mtp/rt --max-context 262144 --kv int8 --pool-workers 15 --conversation-cache-mib 0 --peer-device hip:0 --resident-experts --pcie-frac 0
+strata generate: expert cache auto: 13.70 GiB free, 700 MiB reserved (+218 MiB for the draft head) -> 3103 slots
+strata generate: expert cache 3103 slots, 12.80 GiB of VRAM; policy is
+strata generate: AMD tier on HIP device 0: 7566 experts, 31.21 GiB (filled in 8.2 s); with the NVIDIA cards' 3103 that is 10669 of 24576 on the GPUs
+FileExpertSource: allocating 90.66 GiB page-locked cache complement
+FileExpertSource: copied cache complement through layer 8/48 (22.79 GiB, 11 s)
+FileExpertSource: copied cache complement through layer 16/48 (34.41 GiB, 16 s)
+FileExpertSource: copied cache complement through layer 24/48 (45.82 GiB, 21 s)
+FileExpertSource: copied cache complement through layer 32/48 (68.04 GiB, 30 s)
+FileExpertSource: copied cache complement through layer 40/48 (79.28 GiB, 35 s)
+FileExpertSource: copied cache complement through layer 48/48 (90.66 GiB, 49 s)
+FileExpertSource: mapped pinned cache complement ready: resident 90.66 GiB, pinned 90.66 GiB in 92 s; page-locked and mapped
+FileExpertSource: 506 of the prompt path's 506 lendable slots keep their experts in RAM too
+strata generate: resident RAM mode: 90.66 GiB of experts in RAM (page-locked), 3103 in the GPU cache; adaptive swaps exchange them with the GPU cache (no file reads)
+strata serve: the prompt path borrows 506 CUDA0 cache slots (2.09 GiB)
+strata prefill: the AMD tier computes its experts' rows of each prompt chunk (up to 4096 tokens, through mapped host memory in FP16, one weighted sum per token back)
+strata serve: 249 MiB of VRAM free with everything loaded - LOW: requests may stall; add --vram-reserve-mib 963 to the config's args (or lower --max-context)
+strata serve: WARNING: only 249 MiB of VRAM free at the start of this request (below 512 MiB): when the card is this full the driver can page GPU memory to system RAM, decode falls to a few tok/s and a window may never finish (#2065). Add --vram-reserve-mib 1024 to the config's args, or lower --max-context / --batch
+strata prefill: CUDA device 0 streams no experts from RAM to the AMD tier: the AMD card has 322 MiB of VRAM free, too little for a ring of its copies
+strata serve: WARNING: only 111 MiB of VRAM free at the start of this request (below 512 MiB): when the card is this full the driver can page GPU memory to system RAM, decode falls to a few tok/s and a window may never finish (#2065). Add --vram-reserve-mib 1152 to the config's args, or lower --max-context / --batch

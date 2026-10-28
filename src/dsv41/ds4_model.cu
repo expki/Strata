@@ -1074,34 +1074,11 @@ struct Model::Impl {
     std::thread ram_th;
     int ram_inflight = 0, ram_held = 0;
     bool ram_tier = std::getenv("STRATA_DS4_RAM_TIER") != nullptr && std::atoi(std::getenv("STRATA_DS4_RAM_TIER")) != 0;
-    // STRATA_DS4_DISK_SKIP_W (experimental opt-in, CHANGES THE ANSWERS; 0 = off): on the small windows (decode, a
-    // draft's check - never the prompt path) the CPU lane leaves out a routed expert whose share of its token's route
-    // weights is below this and whose pages are not in RAM now (the page cache or the RAM tier; os::in_ram - Linux every
-    // page, Windows sampled pages of the working set), so a token waits on the SSD only for the experts that weigh; the
-    // weight it carried is lost (no renormalisation).  On layers from STRATA_DS4_DISK_SKIP_FROM (0) on.  An expert left
-    // out still counts as used (the expert cache, the profile).
-    const float disk_skip_w = [] {
-        const char* v = std::getenv("STRATA_DS4_DISK_SKIP_W");
-        return v != nullptr ? std::max(0.0f, (float) std::atof(v)) : 0.0f;
-    }();
-    const int disk_skip_from = [] {
-        const char* v = std::getenv("STRATA_DS4_DISK_SKIP_FROM");
-        return v != nullptr ? std::max(0, std::atoi(v)) : 0;
-    }();
     // the RAM store (--ssd-cache): the CPU lane's experts in slots a policy owns, read unbuffered (null: off)
     std::unique_ptr<ExpertStore> store;
     uint8_t* zc_stage_buf = nullptr;   // device: k staging slots for the store's experts of a decode token
     size_t zc_stride = 0;
     bool zc_copy = true;               // DS4_STORE_STAGE=0: the expert kernels read the arena over PCIe themselves
-    bool in_ram(const Layer& l, int e) const {   // (DISK_SKIP_W) expert e's pages in RAM now
-        if (!l.ram.empty() && l.ram[(size_t) e] >= 0) return true;
-        if (l.lay.fmt == gg::kFmtMXFP4) {
-            for (int r = 0; r < 3; ++r)
-                if (!os::in_ram(mx_mat(l, e, r), mx_part_bytes(l, r))) return false;
-            return true;
-        }
-        return !file_experts || os::in_ram(file_part(l, e), l.blob);
-    }
     // a GGUF's CPU-lane experts copied into RAM (copy_experts, after VRAM took its share: --mmap-experts off - auto reads
     // them in place; DS4_COPY_GB=<n>: the hottest n GB, the rest in place - static, no moves between
     // them): RAM slots (l.ram, as the tier's) of NH parts, part X on NUMA node X with rows [X n / NH, (X + 1) n / NH) of
@@ -2121,7 +2098,6 @@ struct Model::Impl {
         if (o.dspark_block > 0 && std::getenv("DS4_DSPARK_MAX") == nullptr) max_drafts = o.dspark_block;   // (--dspark-block N: at most N drafts a round)
         L.resize((size_t) (g.nl + g.n_mtp));
         int last_src = -1;
-        int experts_used = 1 << 20;
         for (int il = 0; il < g.nl + g.n_mtp; ++il) {
             Layer& l = L[(size_t) il];
             l.il = il;
@@ -2129,26 +2105,14 @@ struct Model::Impl {
             l.name = l.mtp ? "mtp." + std::to_string(il - g.nl) + "." : "layers." + std::to_string(il) + ".";
             l.n_exp = l.mtp ? g.d_n_exp : g.n_exp;
             l.k_exp = l.mtp ? g.d_k : g.k_exp;
-            if (!l.mtp) {   // experts a word takes: --experts N / the faster-mode rule (ds4_experts_rule.hpp), DS4_TOPK=N over both (a test)
-                if (il == 0) {
-                    uint64_t vram_all = 0;
-                    bool integrated = false;   // (a GPU that shares the PC's RAM: Strix Halo)
-                    for (const Dev& dv : devs) {
-                        vram_all += (uint64_t) dv.total;
-                        cudaDeviceProp ip{};
-                        if (cudaGetDeviceProperties(&ip, dv.id) == cudaSuccess && ip.integrated) integrated = true;
-                    }
-                    // two or more RDNA4 cards holding at least half of the experts (the 4 x R9700 class): Faster by default too
-                    const bool multi_rdna4 = rdna4() && devs.size() >= 2 && gpu_expert_share() >= 0.5;
-                    const int n = experts_test_override(experts_per_word(o.experts, vram_all, l.k_exp, integrated, multi_rdna4, defaults_026()), l.k_exp);
-                    experts_used = n;
-                    if (n < l.k_exp)
-                        std::fprintf(stderr, "ds4: experts per word: %d (%s; full quality: --experts %d)\n", n,
-                                     o.experts >= 1 ? "as asked" : multi_rdna4 ? "faster mode: the cards hold most of the experts" : "faster mode", l.k_exp);
-                    else if (o.experts >= 1)
-                        std::fprintf(stderr, "ds4: experts per word: %d (full quality)\n", n);
-                }
-                l.k_exp = std::min(l.k_exp, experts_used);
+            if (!l.mtp && il == 0) {   // every word takes all its routed experts (the faster mode that kept fewer is removed)
+                if (o.experts >= 1 && o.experts < l.k_exp)
+                    std::fprintf(stderr, "ds4: --experts %d is ignored: faster mode was removed, every word takes all %d routed experts\n",
+                                 o.experts, l.k_exp);
+                if (std::getenv("DS4_TOPK") != nullptr)
+                    std::fprintf(stderr, "ds4: DS4_TOPK was removed, every word takes all %d routed experts\n", l.k_exp);
+                for (const char* gone : {"STRATA_DS4_DISK_SKIP_W", "STRATA_DS4_DISK_SKIP_FROM"})
+                    if (std::getenv(gone) != nullptr) std::fprintf(stderr, "ds4: %s was removed, every routed expert is computed\n", gone);
             }
             l.ratio = g.ratios[(size_t) il];
             if (l.mtp) {   // window attention only: no compressor, indexer or Engram
@@ -6788,12 +6752,7 @@ struct Model::Impl {
                         }
                     }
                 }
-                const bool dsk = disk_skip_w > 0.0f && !l.mtp && li >= disk_skip_from && li < g.nl;
                 for (int t = 0; t < T; ++t) {
-                    float wsum = 0.0f;   // (DISK_SKIP_W: the token's route weights)
-                    if (dsk)
-                        for (int i = 0; i < l.k_exp; ++i)
-                            if (r.ids[t][i] >= 0 && r.ids[t][i] < l.n_exp) wsum += r.w[t][i];
                     for (int i = 0; i < l.k_exp; ++i) {
                         const int e = r.ids[t][i];
                         if (e < 0 || e >= l.n_exp) continue;
@@ -6810,10 +6769,6 @@ struct Model::Impl {
                             if (T == 1 && !l.zc.empty() && l.zc[(size_t) e]) {   // the device computed it from the store's slot
                                 store->touch(li, e);
                                 ++st.store_zc;
-                                continue;
-                            }
-                            if (dsk && r.w[t][i] < disk_skip_w * wsum && !in_ram(l, e)) {
-                                ++st.skipped;
                                 continue;
                             }
                             if (!l.ram.empty() && l.ram[(size_t) e] >= 0) ++st.ram_experts;

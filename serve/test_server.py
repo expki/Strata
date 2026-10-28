@@ -2415,6 +2415,26 @@ class PcieShare(unittest.TestCase):
         self.assertEqual([r["hit_rate"] for r in rows], [0.6, 0.6, 0.6])
         self.assertEqual([r["pcie_share"] for r in rows], [0.2, 0.0, None])
         self.assertIn("expert cache 60.0% hit (+20.0% of the routed experts over PCIe)", out.getvalue())
+        self.assertFalse(any("amd_tier_share" in r for r in rows))
+
+    def test_the_amd_tier_s_entries_are_not_called_pcie(self):
+        """--peer-device hip:N: the engine counts the AMD tier's entries in [offloaded] and names them amd_tier=."""
+        tok = ByteTokenizer()
+        engine = DoneLineEngine(tok, "</think>\n\nok", max_context=CTX, done_lines=[
+            "DONE 4 20 40.0 30.0 stop 3 5 0 60 100 0 0 0.0 20 25 chunk=0 experts_streamed=0 amd_tier=25",
+            "DONE 4 20 40.0 30.0 stop 3 5 0 60 100 0 0 0.0 20 25 chunk=0 experts_streamed=0 amd_tier=10"])
+        svc = Service(engine, tok, ChatTemplate(ROOT / "serve/chat_template.jinja"))
+        with contextlib.redirect_stdout(io.StringIO()) as out:
+            for _ in range(2):
+                list(svc.run(tok.encode("hi"), False, None, 10, {}, threading.Event()))
+        rows = list(svc.history)
+        self.assertEqual([r["pcie_share"] for r in rows], [0.0, 0.12])
+        self.assertEqual([r["amd_tier_share"] for r in rows], [0.2, 0.08])
+        lines = [x for x in out.getvalue().splitlines() if "done:" in x]
+        self.assertIn("expert cache 60.0% hit (+20.0% of the routed experts on the AMD tier)", lines[0])
+        self.assertNotIn("PCIe", lines[0])
+        self.assertIn("expert cache 60.0% hit (+12.0% of the routed experts over PCIe, +8.0% on the AMD tier)",
+                      lines[1])
 
 
 class PeerDevice(unittest.TestCase):
@@ -2446,6 +2466,24 @@ class PeerDevice(unittest.TestCase):
         from serve.server import child_env
         env = child_env({"args": ["--peer-device", "1"], "gpu": [0, 1]})
         self.assertEqual(env["CUDA_VISIBLE_DEVICES"], "0,1")
+
+    def test_an_amd_peer_keeps_the_split(self):
+        """--peer-device hip:N is an AMD card beside the layer split: the split and the automatic card order stay."""
+        from serve.server import layer_split_of, ordered_gpus
+        fast_first = {0: 9.0, 1: 3.0}
+        amd = ["--native", "x", "--peer-device", "hip:0"]
+        self.assertTrue(layer_split_of({"args": list(amd), "gpu": [0, 1]}))
+        self.assertEqual(engine_args({"args": list(amd), "gpu": [0, 1]}), amd + ["--layer-split", "auto"])
+        self.assertEqual(ordered_gpus({"args": list(amd), "gpu": [0, 1]}, fast_first), [1, 0])
+        cuda = ["--native", "x", "--peer-device", "1"]   # today's CUDA peer: no split, the config's order
+        self.assertFalse(layer_split_of({"args": list(cuda), "gpu": [0, 1]}))
+        self.assertEqual(engine_args({"args": list(cuda), "gpu": [0, 1]}), cuda)
+        self.assertEqual(ordered_gpus({"args": list(cuda), "gpu": [0, 1]}, fast_first), [0, 1])
+        self.assertFalse(layer_split_of({"args": ["--peer-device", "0"], "gpu": [0, 1]}))   # a plain N, as today
+        self.assertFalse(layer_split_of({"args": ["--peer-device"], "gpu": [0, 1]}))        # no value: as today
+        plain = ["--native", "x"]
+        self.assertTrue(layer_split_of({"args": list(plain), "gpu": [0, 1]}))
+        self.assertEqual(ordered_gpus({"args": list(plain), "gpu": [0, 1]}, fast_first), [1, 0])
 
 
 class LearnedProfile(unittest.TestCase):
@@ -2930,6 +2968,9 @@ class CancelledRead(unittest.TestCase):
         StrataEngine._parse_done(e, "DONE 5 12000 900.0 80.0 stop 3 4 0 7 9 0 0 0.0 12000 2 chunk=x other=1")
         self.assertNotIn("chunk", e.last)
         self.assertNotIn("other", e.last)
+        StrataEngine._parse_done(e, "DONE 5 12000 900.0 80.0 stop 3 4 0 7 9 0 0 0.0 12000 2 chunk=1536 "
+                                    "experts_streamed=0 amd_tier=2")
+        self.assertEqual((e.last["chunk"], e.last["amd_tier"], e.last["offloaded"]), (1536, 2, 2))
 
     def test_request_stats_chunk_fields(self):
         """Across a request's continuations the streamed blobs add up; the chunk is the request's own read's."""
@@ -2937,6 +2978,9 @@ class CancelledRead(unittest.TestCase):
                                {"prompt_ms": 2.0, "chunk": 64, "experts_streamed": 5}])
         self.assertEqual((stats["chunk"], stats["experts_streamed"], stats["prompt_ms"]), (1536, 105, 12.0))
         self.assertNotIn("chunk", request_stats([{"prompt_ms": 1.0}, {"prompt_ms": 1.0, "chunk": 64}]))
+        segments = [{"offloaded": 7, "amd_tier": 5}, {"offloaded": 3, "amd_tier": 2}]
+        self.assertEqual(request_stats(segments)["amd_tier"], 7)
+        self.assertNotIn("amd_tier", request_stats([{"offloaded": 7}, {"offloaded": 3}]))
 
     def test_prompt_tokens_seen(self):
         last = {"finish": "cancel", "reused": 1000, "prompt_read": 2000}

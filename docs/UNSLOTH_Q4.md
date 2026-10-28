@@ -35,8 +35,8 @@ strata launch --family unsloth --model UD-Q4_K_XL
   deleted, so the next run downloads it again.
 - **Packing.** `--compat-bf16`, and never an `experts.bin` (`--low-ram` does not apply).
 - **Defaults it writes** into the run config's `env`: `STRATA_HC_Q8=1` on CUDA (the GGUF's own Q8_0 hyper-connection
-  projections, closer to the file and faster), and `STRATA_ROUTE_TAIL_SKIP=0` where every expert is in RAM. UD-Q4_K_XL
-  keeps `STRATA_MMQ_KQ` opt-in.
+  projections, closer to the file and faster). UD-Q4_K_XL keeps `STRATA_MMQ_KQ` opt-in. Older setups also wrote
+  `STRATA_ROUTE_TAIL_SKIP=0`. The engine removed that switch, and a setup run again drops it from the config.
 - **Context.** It recommends 8K on a GPU under 14 GB, because every GB of KV cache is a GB less of cached experts.
 - **GPUs.** NVIDIA or AMD. One GPU is the default in the budget mode. With several GPUs, each card caches the experts of
   its own layers and the budget holds the hottest of the rest by the whole expert profile. Setup asks; `--gpus 0,1`
@@ -196,9 +196,9 @@ same top 20 per position.
 
 | Variable | Effect |
 | --- | --- |
-| `STRATA_LOOKAHEAD=0` | Turns off the routing-aware prefetch (on by default in this mode). While the CPU works on a layer, a thread applies the next layer's router to this layer's input and asks the OS to read the predicted experts' pages. Pages only; the answers are the same. `STRATA_LOOKAHEAD_K` sets the experts per token (default 10). |
+| `STRATA_LOOKAHEAD=0` | Turns off the routing-aware prefetch (on by default in this mode, and in serve beside the AMD tier off while every expert is in RAM; `STRATA_LOOKAHEAD=1` keeps it on). While the CPU works on a layer, a thread applies the next layer's router to this layer's input and asks the OS to read the predicted experts' pages. Pages only; the answers are the same. `STRATA_LOOKAHEAD_K` sets the experts per token (default 10). |
 | `STRATA_MMQ_KQ=1` | Multiplies the Q4_K / Q5_K / Q5_1 experts of a prompt with llama.cpp's MMQ kernels instead of dequantizing them to FP16. It rounds differently from the FP16 path, so it is opt-in for this file. On CUDA the kernels are a library next to the engine (`libstrata_kq.so` / `strata_kq.dll`), opened only then, so they take no VRAM from other models ([QUANTS.md](QUANTS.md)). |
-| `STRATA_KQ256=1` | Multi-token AVX2 kernels for the Q4_K / Q5_1 / Q8_0 experts. Bit-exact with ggml's, but measured no faster, so off. |
+| `STRATA_KQ256=1` | Multi-token AVX2 kernels for the Q4_K / Q5_1 experts. Bit-exact with ggml's, but measured no faster, so off. Q8_0 down rows (and Q6_K gate/up) take them by default from two tokens of an expert ([QUANTS.md](QUANTS.md)). |
 | `STRATA_PARTIAL_PIN=1` | Registers the hottest part of the RAM budget (up to `STRATA_PARTIAL_PIN_GIB`, default 24) with the GPU driver, so the GPU computes a share of the misses over PCIe (`--pcie-frac`). Measured no faster, and it changes the numerics of those experts, so off. |
 | `STRATA_FETCH_THREADS=N` | Threads that read the experts from the GGUF while it answers (default 8). The prompt path has its own: `STRATA_STAGER_THREADS` (default 32 here) and `STRATA_STAGER_RING` (128). |
 | `STRATA_RESIDENT_PIN=0` | Ordinary pageable memory for the RAM budget (see above). |

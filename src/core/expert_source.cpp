@@ -3,6 +3,7 @@
 #include "strata/core/expert_nibble.hpp"
 #include "strata/core/foresight_swap.hpp"
 #include "strata/core/on_device.hpp"
+#include "strata/core/page_spread.hpp"
 #include "strata/platform/aux_cpus.hpp"
 #include "strata/core/remote_experts.hpp"
 #include "strata/core/peer_experts.hpp"
@@ -25,6 +26,7 @@
 #include <cassert>
 #include <cerrno>
 #include <chrono>
+#include <condition_variable>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -303,6 +305,27 @@ bool exchange_cache_complement(std::vector<uint64_t>& offsets, size_t in, size_t
     offsets[out] = offsets[in];
     offsets[in] = kNoCacheComplement;
     return true;
+}
+
+std::vector<uint64_t> page_align_layers(int64_t n_layers, int64_t n_expert, const std::vector<uint64_t>& layer_blob_bytes,
+                                        std::vector<uint64_t>& offsets, uint64_t& bytes, uint64_t page) {
+    std::vector<uint64_t> starts((size_t) n_layers + 1, 0);
+    uint64_t at = 0;
+    for (int64_t layer = 0; layer < n_layers; ++layer) {
+        at = (at + page - 1) / page * page;
+        starts[(size_t) layer] = at;
+        for (int64_t expert = 0; expert < n_expert; ++expert) {
+            uint64_t& off = offsets[(size_t) layer * (size_t) n_expert + (size_t) expert];
+            if (off == kNoCacheComplement) continue;
+            off = at;
+            at += layer_blob_bytes[(size_t) layer];
+        }
+    }
+    // the last layer ends on a page too, so its registration takes no page past the copy
+    at = (at + page - 1) / page * page;
+    starts[(size_t) n_layers] = at;
+    bytes = at;
+    return starts;
 }
 
 }  // namespace detail
@@ -1015,6 +1038,17 @@ uint64_t FileExpertSource::cached_bytes(int64_t layer, int64_t expert, uint64_t&
 #endif
 }
 
+bool FileExpertSource::all_resident(const std::function<bool(int32_t, int32_t)>& gpu_held) const {
+    for (int64_t l = 0; l < n_layers_; ++l)
+        for (int64_t e = 0; e < n_expert_; ++e) {
+            if (gpu_held && gpu_held((int32_t) l, (int32_t) e)) continue;
+            if (has_resident(l, e)) continue;
+            uint64_t total = 0;
+            if (cached_bytes(l, e, total, false) < total || total == 0) return false;
+        }
+    return true;
+}
+
 FileExpertSource::IoCounters FileExpertSource::io_counters() const {
     IoCounters c;
     c.cached_bytes = io_cached_.load(std::memory_order_relaxed);
@@ -1526,7 +1560,14 @@ void FileExpertSource::close() {
     ram_stop();
     io_stop();
     inputs_.clear();
-    if (complement_arena_ != nullptr) {
+    if (complement_arena_ != nullptr && complement_map_bytes_ > 0) {
+#if !defined(_WIN32)
+        for (const uint64_t a : complement_reg_starts_) (void) cudaHostUnregister((uint8_t*) complement_arena_ + a);
+        if (complement_locked_ > 0)
+            strata::platform::unlock_resident((uint8_t*) complement_arena_ + complement_lock_off_, complement_locked_);
+        (void) munmap(complement_arena_, (size_t) complement_map_bytes_);
+#endif
+    } else if (complement_arena_ != nullptr) {
         if (complement_pinned_ && !complement_registered_) (void) cudaFreeHost(complement_arena_);
         else {
             if (complement_registered_) (void) cudaHostUnregister(complement_arena_);
@@ -1560,6 +1601,9 @@ void FileExpertSource::close() {
     complement_lock_off_ = 0;
     complement_ready_ = false;
     complement_locked_ = 0;
+    complement_map_bytes_ = 0;
+    complement_reg_starts_.clear();
+    copy_fill_ = CopyFill{};
     complement_lent_slots_ = 0;
     if (!maps_.empty()) {
         for (Map& m : maps_) {
@@ -2692,8 +2736,9 @@ bool FileExpertSource::map_view(std::string& why) {
 #endif
 }
 
-bool FileExpertSource::read_direct(const Fill* fills, size_t n) const {
+bool FileExpertSource::read_direct(const Fill* fills, size_t n, const std::vector<void*>* fds) const {
 #if defined(_WIN32)
+    (void) fds;
     // NTFS runs the unbuffered reads of a file one at a time while the file is mapped or cached anywhere (the engine
     // maps the GGUF shards for the token embedding and the PLE table): measured on a PCIe 5 drive, 512 KiB reads at
     // queue depth 48 make 10.4 GB/s on a file nobody maps and 3.4 GB/s on a mapped one, 8 MiB reads 8.6 GB/s.  So
@@ -2882,7 +2927,8 @@ bool FileExpertSource::read_direct(const Fill* fills, size_t n) const {
                 continue;
             }
         }
-        sc.req.push_back({(int) (intptr_t) (direct_.empty() ? pdirect_ : direct_)[(size_t) x.file], x.a0, x.size, total});
+        sc.req.push_back({(int) (intptr_t) (fds != nullptr ? *fds : direct_.empty() ? pdirect_ : direct_)[(size_t) x.file], x.a0,
+                          x.size, total});
         total += x.size;
         last_file = x.file;
         x.req = sc.req.size() - 1;
@@ -2949,7 +2995,7 @@ bool FileExpertSource::read_direct(const Fill* fills, size_t n) const {
     }
     return true;
 #else
-    (void) fills; (void) n;
+    (void) fills; (void) n; (void) fds;
     return false;
 #endif
 }
@@ -3460,6 +3506,223 @@ uint64_t FileExpertSource::release(int64_t layer, int64_t expert) {
 #endif
 }
 
+#if defined(__linux__) && !defined(STRATA_HIP_GFX906)
+void FileExpertSource::drop_copied_pages(int64_t layer, const std::vector<uint64_t>& offsets) const {
+    constexpr uintptr_t kPage = 4096;
+    const size_t row = (size_t) layer * (size_t) n_expert_;
+    const int roles = role_ptr_.empty() ? 1 : 3;
+    for (int r = 0; r < roles; ++r) {
+        const uint8_t* p = nullptr;
+        uint64_t per = 0, file_off = 0;
+        int fd = -1;
+        bool mapped = !unmapped_;
+        if (role_ptr_.empty()) {
+            per = layer_blob_bytes_[(size_t) layer];
+            file_off = layer_offsets_[(size_t) layer];
+            p = base_ + (size_t) file_off;
+            fd = fd_;
+        } else {
+            const size_t i = (size_t) (3 * layer + r);
+            const Map& m = maps_[(size_t) role_file_[i]];
+            per = role_bytes_[i];
+            p = role_ptr_[i];
+            file_off = (uint64_t) (role_ptr_[i] - m.base);
+            fd = m.fd;
+            mapped = mapped && !m.closed;
+        }
+        // the mapping's pages first: a page cache page still mapped here is not dropped
+        if (mapped) {
+            const uintptr_t a = (uintptr_t) p & ~(kPage - 1);
+            const uintptr_t e = ((uintptr_t) p + (uintptr_t) (per * (uint64_t) n_expert_) + kPage - 1) & ~(kPage - 1);
+            (void) madvise((void*) a, (size_t) (e - a), MADV_DONTNEED);
+        }
+        if (fd < 0) continue;
+        for (int64_t e = 0; e < n_expert_;) {   // each run of copied experts at once, so the pages they share go too
+            if (offsets[row + (size_t) e] == kNoComplement) { ++e; continue; }
+            int64_t end = e;
+            while (end < n_expert_ && offsets[row + (size_t) end] != kNoComplement) ++end;
+            (void) posix_fadvise(fd, (off_t) (file_off + (uint64_t) e * per), (off_t) ((uint64_t) (end - e) * per),
+                                 POSIX_FADV_DONTNEED);
+            e = end;
+        }
+    }
+}
+
+bool FileExpertSource::fill_by_layer(const std::vector<uint64_t>& offsets, uint8_t* host,
+                                     const std::vector<uint64_t>& starts, uint64_t reserve, uint64_t& registered,
+                                     std::vector<uint64_t>& reg_starts, std::string& note, std::string& err) {
+    const auto t0 = std::chrono::steady_clock::now();
+    registered = 0;
+    reg_starts.clear();
+    // O_DIRECT descriptors for the experts the page cache does not hold (the file tier's own when it has them)
+    std::vector<void*> own;
+    if (direct_.empty())
+        for (const std::string& path : paths_) {
+            const int fd = ::open(path.c_str(), O_RDONLY | O_DIRECT | O_CLOEXEC);
+            if (fd < 0) {
+                for (void* d : own) close_direct(d);
+                own.clear();
+                break;
+            }
+            own.push_back((void*) (intptr_t) fd);
+        }
+    const std::vector<void*>* fds = !direct_.empty() ? &direct_ : own.empty() ? nullptr : &own;
+    int dev = 0;
+    (void) cudaGetDevice(&dev);
+    std::mutex mu;
+    std::condition_variable cv;
+    std::vector<uint8_t> done((size_t) n_layers_, 0);
+    std::atomic<int64_t> next{0}, pageable_from{n_layers_};
+    std::atomic<uint64_t> drive{0};
+    std::atomic<bool> failed{false};
+    std::string fail_msg, stop;
+    double register_s = 0;
+    int fill_threads = 1;
+    // the layer's pages first touched in PageSpread's order: six of eight DIMMs have no channel interleave, harmless with it
+    static const bool spread = [] { const char* v = std::getenv("STRATA_COPY_SPREAD"); return v == nullptr || std::atoi(v) != 0; }();
+    std::atomic<uint64_t> spread_us{0};
+    auto worker = [&]() {
+        std::vector<Fill> uncached;
+        for (;;) {
+            const int64_t layer = next.fetch_add(1);
+            if (layer >= n_layers_ || failed.load()) return;
+            const uint64_t blob = layer_blob_bytes_[(size_t) layer];
+            if (spread) {
+                const auto s0 = std::chrono::steady_clock::now();
+                const uint64_t a = starts[(size_t) layer], pages = (starts[(size_t) layer + 1] - a + 4095) / 4096;
+                const PageSpread order(pages);
+                volatile uint8_t* const first = host + a;
+                for (uint64_t i = 0; i < pages; ++i) first[order.page(i) * 4096] = 0;
+                spread_us.fetch_add((uint64_t) std::chrono::duration<double, std::micro>(std::chrono::steady_clock::now() - s0).count());
+            }
+            uncached.clear();
+            for (int64_t e = 0; e < n_expert_; ++e) {
+                const uint64_t off = offsets[(size_t) layer * (size_t) n_expert_ + (size_t) e];
+                if (off == kNoComplement) continue;
+                Span sp[3];
+                const int ns = spans(layer, e, sp);
+                bool cached = ns > 0;
+                for (int i = 0; i < ns && cached; ++i) cached = resident_in(sp[i].p, sp[i].n) >= sp[i].n;
+                if (!cached) {
+                    uncached.push_back({0, layer, e, host + off});
+                    continue;
+                }
+                for (int i = 0; i < ns; ++i) std::memcpy(host + off + sp[i].at, sp[i].p, (size_t) sp[i].n);
+            }
+            if (!uncached.empty()) {
+                // the pages read here add to the RAM in use, unless the spread already faulted them in
+                uint64_t avail = 0;
+                if (!available_memory_bytes(avail) || !detail::pin_step_fits(avail, spread ? 0 : blob * uncached.size(), reserve)) {
+                    int64_t cur = pageable_from.load();
+                    while (layer < cur && !pageable_from.compare_exchange_weak(cur, layer)) {}
+                }
+                for (size_t i = 0; i < uncached.size(); i += 32) {
+                    const size_t n = std::min<size_t>(32, uncached.size() - i);
+                    if (fds != nullptr && read_direct(uncached.data() + i, n, fds)) {
+                        drive.fetch_add(blob * n);
+                        continue;
+                    }
+                    for (size_t j = i; j < i + n; ++j)
+                        if (!copy_from_files(uncached[j].layer, uncached[j].e, uncached[j].dst)) {
+                            std::lock_guard<std::mutex> lk(mu);
+                            if (fail_msg.empty())
+                                fail_msg = "FileExpertSource: an expert could not be read while building the RAM copy";
+                            failed.store(true);
+                            cv.notify_all();
+                            return;
+                        }
+                }
+            }
+            drop_copied_pages(layer, offsets);
+            {
+                std::lock_guard<std::mutex> lk(mu);
+                done[(size_t) layer] = 1;
+            }
+            cv.notify_all();
+        }
+    };
+    // registers each completed layer in order, so the registered part is always a prefix of the copy
+    std::thread registrar([&]() {
+        strata::aux_cpus::place_prompt_thread();   // off the host's CPU, which a new thread inherits
+        (void) cudaSetDevice(dev);
+        for (int64_t layer = 0; layer < n_layers_; ++layer) {
+            {
+                std::unique_lock<std::mutex> lk(mu);
+                cv.wait(lk, [&] { return done[(size_t) layer] != 0 || failed.load(); });
+            }
+            if (failed.load()) return;
+            if (layer >= pageable_from.load()) {
+                stop = "the RAM left would fall under the reserve";
+                return;
+            }
+            const uint64_t a = starts[(size_t) layer], b = starts[(size_t) layer + 1];
+            if (b == a) continue;
+            const auto r0 = std::chrono::steady_clock::now();
+            const cudaError_t e = cudaHostRegister(host + a, (size_t) (b - a), cudaHostRegisterPortable | cudaHostRegisterMapped);
+            if (e != cudaSuccess) {
+                (void) cudaGetLastError();
+                stop = std::string("the driver refused to page-lock it: ") + cudaGetErrorString(e);
+                return;
+            }
+            void* alias = nullptr;
+            if (cudaHostGetDevicePointer(&alias, host + a, 0) != cudaSuccess || alias != (void*) (host + a)) {
+                (void) cudaGetLastError();
+                (void) cudaHostUnregister(host + a);
+                stop = "its device address is not its host address";
+                return;
+            }
+            register_s += std::chrono::duration<double>(std::chrono::steady_clock::now() - r0).count();
+            reg_starts.push_back(a);
+            registered = b;
+        }
+    });
+    {
+        const unsigned hw = std::thread::hardware_concurrency();
+        const int threads = (int) std::max<int64_t>(1, std::min<int64_t>({15, (int64_t) (hw > 1 ? hw - 1 : 1), n_layers_}));
+        fill_threads = threads;
+        std::vector<std::thread> pool;
+        for (int i = 1; i < threads; ++i)
+            pool.emplace_back([&]() {
+                strata::aux_cpus::place_prompt_thread();
+                worker();
+            });
+        worker();
+        for (auto& t : pool) t.join();
+    }
+    cv.notify_all();
+    registrar.join();
+    for (void* d : own) close_direct(d);
+    if (failed.load()) {
+        for (uint64_t a : reg_starts) (void) cudaHostUnregister(host + a);
+        reg_starts.clear();
+        registered = 0;
+        err = fail_msg;
+        return false;
+    }
+    if (!stop.empty()) {
+        char msg[320];
+        std::snprintf(msg, sizeof msg, "WARNING: only %.2f of %.2f GiB could be page-locked (%s); the rest is resident "
+                      "but pageable, so its copies to the GPU go through the CPU",
+                      (double) registered / 1073741824.0, (double) starts.back() / 1073741824.0, stop.c_str());
+        std::fprintf(stderr, "FileExpertSource: %s\n", msg);
+        note = msg;
+    }
+    copy_fill_.by_layer = true;
+    copy_fill_.seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+    copy_fill_.register_s = register_s;
+    copy_fill_.drive_bytes = drive.load();
+    copy_fill_.spread_s = spread ? (double) spread_us.load() / 1e6 / fill_threads : -1;
+    return true;
+}
+#else
+void FileExpertSource::drop_copied_pages(int64_t, const std::vector<uint64_t>&) const {}
+bool FileExpertSource::fill_by_layer(const std::vector<uint64_t>&, uint8_t*, const std::vector<uint64_t>&, uint64_t,
+                                     uint64_t&, std::vector<uint64_t>&, std::string&, std::string& err) {
+    err = "FileExpertSource: the layer-order copy is Linux and CUDA only";
+    return false;
+}
+#endif
+
 bool FileExpertSource::pin_cache_complement(
     const ExpertCache& cache, std::string& err, bool pin,
     const std::vector<std::pair<int32_t, int32_t>>& additional_gpu_pairs, int64_t lend_from_slot,
@@ -3681,6 +3944,21 @@ bool FileExpertSource::pin_cache_complement(
         stage_lent_bytes = bytes - before;
     }
 
+    // the layer-order copy, filled and registered layer by layer (STRATA_PIN_ALLOC=host: one cudaHostAlloc as before)
+    copy_fill_ = CopyFill{};
+    bool by_layer = false;
+#if defined(__linux__) && !defined(STRATA_HIP_GFX906)
+    {
+        const char* alloc = std::getenv("STRATA_PIN_ALLOC");
+        const char* guard = std::getenv("STRATA_PIN_GUARD");
+        by_layer = pin && bytes > 0 && budget_bytes == 0 && stage_lend_regions_.empty() &&
+                   !(alloc != nullptr && std::strcmp(alloc, "host") == 0) && !(guard != nullptr && std::atoi(guard) == 2) &&
+                   !strata::kernels::cpu::active_numa_split().on;
+    }
+#endif
+    std::vector<uint64_t> layer_starts;
+    if (by_layer) layer_starts = detail::page_align_layers(n_layers_, n_expert_, layer_blob_bytes_, offsets, bytes);
+
     void* arena = nullptr;
     const uint8_t* host = nullptr;
     const uint8_t* device = nullptr;
@@ -3690,11 +3968,22 @@ bool FileExpertSource::pin_cache_complement(
     uint64_t partial_pin = 0;   ///< CS-T: a registered prefix of a locked arena
     uint64_t lock_off = 0;      ///< where the working-set lock starts (after the registered prefix)
     std::string note;
+    uint64_t map_bytes = 0;               ///< the layer-order copy: its anonymous mapping
+    std::vector<uint64_t> reg_starts;     ///< the layer-order copy: each registered layer's start
 #if defined(__linux__)
     NumaComplementPlacement numa;   ///< STRATA_NUMA_SPLIT step B; inert unless the live pool split on real nodes
 #endif
     auto release = [&]() {
         if (arena == nullptr) return;
+#if !defined(_WIN32)
+        if (map_bytes > 0) {
+            for (uint64_t a : reg_starts) (void) cudaHostUnregister((uint8_t*) arena + a);
+            if (locked > 0) strata::platform::unlock_resident((uint8_t*) arena + lock_off, locked);
+            (void) munmap(arena, (size_t) map_bytes);
+            arena = nullptr;
+            return;
+        }
+#endif
         if (pinned_ok) (void) cudaFreeHost(arena);
         else {
             if (partial_pin > 0) (void) cudaHostUnregister(arena);
@@ -3725,7 +4014,31 @@ bool FileExpertSource::pin_cache_complement(
         }
     };
 #endif
-    if (bytes > 0) {
+    const uint64_t pace_reserve = [&] {   // STRATA_PIN_RESERVE_GIB, see the #1250 note below
+        const char* v = std::getenv("STRATA_PIN_RESERVE_GIB");
+        return v != nullptr && std::atof(v) > 0 ? (uint64_t) (std::atof(v) * 1073741824.0)
+                                                 : std::max<uint64_t>(headroom_bytes, 2ull << 30);
+    }();
+#if defined(__linux__) && !defined(STRATA_HIP_GFX906)
+    if (by_layer) {
+        // 4 KiB pages, taken as the layers are copied: the RAM in use stays flat while each layer's file pages go
+        void* m = mmap(nullptr, (size_t) bytes, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_NORESERVE, -1, 0);
+        if (m == MAP_FAILED) {
+            std::fprintf(stderr, "FileExpertSource: the layer-order copy cannot be mapped (errno %d): one allocation "
+                                 "instead\n", errno);
+            by_layer = false;
+        } else {
+            (void) madvise(m, (size_t) bytes, MADV_NOHUGEPAGE);
+            arena = m;
+            host = (const uint8_t*) m;
+            map_bytes = bytes;
+            std::fprintf(stderr, "FileExpertSource: allocating %.2f GiB page-locked cache complement, filled and "
+                                 "registered layer by layer\n", (double) bytes / 1073741824.0);
+            std::fflush(stderr);
+        }
+    }
+#endif
+    if (bytes > 0 && !by_layer) {
         std::fprintf(stderr, "FileExpertSource: allocating %.2f GiB %s cache complement\n",
                      (double) bytes / 1073741824.0, pin ? "page-locked" : "pageable resident");
         log_complement_memory("before complement allocation", bytes);
@@ -3737,11 +4050,6 @@ bool FileExpertSource::pin_cache_complement(
         // STRATA_PIN_GUARD=0 pages-locks in one go as before, =2 always registers in steps (a test); STRATA_PIN_RESERVE_GIB
         // is the RAM that must stay above every step (default: the resident headroom, at least 2 GiB)
         // STRATA_NUMA_SPLIT placement forces the drop and the paced path whatever the guard (STRATA_PIN_GUARD=0 included)
-        const uint64_t pace_reserve = [&] {
-            const char* v = std::getenv("STRATA_PIN_RESERVE_GIB");
-            return v != nullptr && std::atof(v) > 0 ? (uint64_t) (std::atof(v) * 1073741824.0)
-                                                     : std::max<uint64_t>(headroom_bytes, 2ull << 30);
-        }();
 #if defined(__linux__)
         if (pin) {
             static const int guard = [] {
@@ -4071,7 +4379,22 @@ bool FileExpertSource::pin_cache_complement(
                              std::chrono::duration<double>(std::chrono::steady_clock::now() - copy_t0).count());
         }
     };
-    {
+    if (by_layer) {
+        std::string stop;
+        if (!fill_by_layer(offsets, (uint8_t*) arena, layer_starts, pace_reserve, partial_pin, reg_starts, stop, err)) {
+            release();
+            return false;
+        }
+        device = partial_pin > 0 ? host : nullptr;   // the registrar checked each layer's device address is its host address
+        lock_off = partial_pin;
+        note = stop.empty() ? "page-locked and mapped layer by layer" : stop;
+        if (lock_off < bytes) {   // what could not be registered stays resident, as on the paced path
+            const strata::platform::LockResult lr = strata::platform::lock_resident((uint8_t*) arena + lock_off, bytes - lock_off);
+            locked = lr.locked_bytes;
+            note += "; " + lr.note;
+        }
+        for (const uint64_t o : offsets) copy_fill_.experts += o != kNoComplement;
+    } else {
         const int threads = (int) std::max<int64_t>(1, std::min<int64_t>(6, n_layers_));
         std::vector<std::thread> pool;
         for (int i = 1; i < threads; ++i) pool.emplace_back(worker);
@@ -4119,8 +4442,10 @@ bool FileExpertSource::pin_cache_complement(
     complement_pinned_ = (pinned_ok || partial_pin > 0) && bytes > 0;
     complement_pin_limit_ = pinned_ok ? bytes : partial_pin;
     complement_registered_ = !pinned_ok && partial_pin > 0;
-    // a paced registration that covers the whole arena is as good as a cudaHostAlloc'd one
-    complement_partial_ = complement_registered_ && !(paced && partial_pin >= bytes);
+    // a paced or layer by layer registration that covers the whole arena is as good as a cudaHostAlloc'd one
+    complement_partial_ = complement_registered_ && !((paced || by_layer) && partial_pin >= bytes);
+    complement_map_bytes_ = map_bytes;
+    complement_reg_starts_ = std::move(reg_starts);
     complement_locked_ = locked;
     complement_lock_off_ = lock_off;
     complement_lent_slots_ = lend ? n_slots - keep_from : budget_lent;   // a budget keeps its own tail of the region
@@ -4792,23 +5117,6 @@ constexpr int64_t kMaxWindowEntries = 128;
 static_assert(strata::kernels::cpu::MAXT * 10 <= kMaxWindowEntries, "a verify window's entries overflow the tables");
 }  // namespace
 
-namespace {
-// STRATA_ROUTE_TAIL_SKIP: the rank from which a missed expert that every token of the window routes that low is skipped.  An
-// explicit environment value is read once; the serve start-up (generate.cpp) sets the CUDA default where it applies.
-std::atomic<int> g_tail_skip_rank{-1};   // -1: not resolved yet
-}  // namespace
-int tail_skip_rank() {
-    int r = g_tail_skip_rank.load(std::memory_order_relaxed);
-    if (r < 0) {
-        const char* v = std::getenv("STRATA_ROUTE_TAIL_SKIP");
-        r = v != nullptr ? std::atoi(v) : 0;
-        r = r > 0 && r < 10 ? r : 0;
-        g_tail_skip_rank.store(r, std::memory_order_relaxed);
-    }
-    return r;
-}
-void set_tail_skip_rank(int r) { g_tail_skip_rank.store(r > 0 && r < 10 ? r : 0, std::memory_order_relaxed); }
-
 void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32_t* ids, int64_t n_tok, int64_t k,
                                 float* out, strata::kernels::cpu::NativeArithmetic arithmetic) {
     using namespace strata::kernels::cpu;
@@ -4884,29 +5192,6 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
                     !(d.peer != nullptr && d.peer->has(d.layers, e)) && !helper_holds(e)) ++nmiss;
             }
         }
-        // STRATA_ROUTE_TAIL_SKIP=R (default 7 on CUDA serve, =0 off; changes the output): a missed expert that EVERY token of the window routes
-        // only at rank >= R (the smallest weights of the top-10) is neither copied nor computed; its contribution is
-        // zero, without renormalisation (the others keep the weight the router gave them).  Less PCIe and CPU work.
-        const int tail_rank = tail_skip_rank();
-        bool skip_d[kMaxWindowEntries];
-        for (int q = 0; q < nd; ++q) skip_d[q] = false;
-        if (tail_rank > 0 && d.peer == nullptr && d.remote_count == 0) {
-            int minr[kMaxWindowEntries];
-            for (int q = 0; q < nd; ++q) minr[q] = 99;
-            for (int64_t i = 0; i < n; ++i) {
-                int q = 0;
-                while (q < nd && distinct[q] != first_of[i]) ++q;
-                if (q < nd) minr[q] = std::min(minr[q], (int) (i % k));
-            }
-            for (int q = 0; q < nd; ++q) {
-                const int32_t e = ids[distinct[q]];
-                if (e < 0 || e >= d.n_expert || minr[q] < tail_rank) continue;
-                if (d.host_res[(size_t) d.layers * (size_t) d.n_expert + (size_t) e] >= 0) continue;   // resident
-                skip_d[q] = true;
-                --nmiss;
-                ++d.tail_experts;
-            }
-        }
         // STRATA_PCIE_BALANCE (opt-in, #1548): the count comes from the measured CPU and GPU costs instead of the share
         const bool pcie_ok = (d.pcie_num > 0 || d.pcie_model.on) && d.src->pcie_layer(d.layers);
         int m = pcie_ok ? d.pcie_model.pick(nmiss, (nmiss * d.pcie_num) >> 8) : 0;
@@ -4924,11 +5209,6 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
             const int32_t e = ids[i0];
             int kd = -1;
             unsigned long long ptr = 0;
-            if (skip_d[q]) {                       // STRATA_ROUTE_TAIL_SKIP: neither copied nor computed
-                for (int64_t i = i0; i < n; ++i)
-                    if (first_of[i] == i0) kind[i] = -2;
-                continue;
-            }
             if (e >= 0 && e < d.n_expert) {
                 const int32_t slot = d.host_res[(size_t) d.layers * (size_t) d.n_expert + (size_t) e];
                 if (slot >= 0) {
@@ -5026,7 +5306,7 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
     const bool gpu_zeroes_hits = (d.plan != nullptr && n <= kMaxWindowEntries && n <= d.plan->cap && dec_batch && !device_plan);
     bool any_cpu = false;
     for (int64_t i = 0; i < n; ++i)
-        if (kind[i] == -1) { any_cpu = true; break; }   // -2: skipped (STRATA_ROUTE_TAIL_SKIP), no work
+        if (kind[i] == -1) { any_cpu = true; break; }
     if (d.dres_check != nullptr && any_cpu) {   // STRATA_ADAPT_CHECKRES
         bool published = false;
         for (int64_t i = 0; i < n && !published; ++i)
@@ -5105,11 +5385,6 @@ void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32
                 d.fail_layer = d.layers;
                 d.fail_expert = e;
                 return;
-            }
-            if (kind[i] == -2) {            // STRATA_ROUTE_TAIL_SKIP: a skipped tail expert contributes zero
-                std::memset(row, 0, (size_t) H * sizeof(float));
-                ++d.tail_skipped;
-                continue;
             }
             if (kind[i] >= 0) {             // CUDA0, PCIe, or a remote/peer result staged into this row below
                 if (kind[i] == 0) ++d.cache_hits;

@@ -39,17 +39,13 @@ int abi_args_size() { return (int) sizeof(mmq_args); }
 #endif
 namespace {
 #if defined(STRATA_MMQ_KQUANTS)
-// MODEL-UPDATE Phase 1: the K-quant products through MMQ are opt-in at run time (STRATA_MMQ_KQ=1); on CUDA their
-// kernels are the strata_kq library (mmq_kq_loader.cpp), opened only then
-bool kq_ok() {
+static_assert(GGML_TYPE_Q6_K == kq::kQ6K, "mmq_kq_abi.hpp names Q6_K by ggml's id");
+// Which K-quant products go through MMQ is kq::wanted's rule, on CUDA with the strata_kq library (mmq_kq_loader.cpp)
+bool kq_ok(int t) {
 #if defined(STRATA_KQ_DSO)
-    return kq::available();
+    return kq::available(t);
 #else
-    static const bool on = [] {
-        const char* v = std::getenv("STRATA_MMQ_KQ");
-        return v != nullptr && v[0] == '1';
-    }();
-    return on;
+    return kq::wanted(t);
 #endif
 }
 #endif
@@ -335,7 +331,7 @@ bool supported(int t) {
 #ifdef STRATA_MMQ_KQUANTS
         // Unsloth's UD-Q4/Q5/Q6_K_XL experts; on HIP also the dense GGUF projections (STRATA_DENSE_MMQ)
         case GGML_TYPE_Q4_K: case GGML_TYPE_Q5_K: case GGML_TYPE_Q5_1: case GGML_TYPE_Q6_K:
-            return kq_ok();
+            return kq_ok(t);
 #endif
 #if !defined(GGML_USE_HIP)
         case GGML_TYPE_NVFP4:

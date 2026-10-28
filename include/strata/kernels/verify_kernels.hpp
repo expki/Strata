@@ -85,6 +85,10 @@ void handoff_publish(float* dst, const float* a, int64_t na, const float* b, int
 /// The reading stage's hand-off wait, bounded: spin until *flag >= value, or after timeout_ns (0: no bound) set
 /// *err = 1 (mapped) and return, so the window's graph completes and the host fails the window cleanly.
 void wait_handoff(const uint32_t* flag, uint32_t value, uint32_t* err, unsigned long long timeout_ns, void* stream);
+/// wait_handoff that also returns at once while *err (mapped, not null) is set: a wait queued behind one that timed out adds no second timeout.
+void wait_handoff_or_err(const uint32_t* flag, uint32_t value, uint32_t* err, unsigned long long timeout_ns, void* stream);
+/// One thread: a system fence, then a volatile store of `value` to `flag` (mapped host memory), ordered after the stream's earlier work.
+void raise_flag(uint32_t* flag, uint32_t value, void* stream);
 /// wait_flag_ge, also writing the GPU's clock (ns, gpu_stamp's) as the kernel starts into *t_in and as it returns
 /// into *t_out (either may be null): the verify window's PCIe-share balance, at no extra launch.
 void wait_flag_ge_stamped(const uint32_t* flag, uint32_t value, unsigned long long* t_in, unsigned long long* t_out,
@@ -192,10 +196,5 @@ void dense_steps(const int32_t* cells, int n, int32_t* steps, void* stream);
 /// A sliding attention window: for `n` step records (kStepCount ints each, n_kv at [1]) the selection becomes the
 /// last `window` cells: ids[q * ids_stride + j] = max(0, n_kv - window) + j and the record's width = the count.
 void window_ids(int32_t* steps, int n, int window, int32_t* ids, int64_t ids_stride, void* stream);
-/// window_ids whose window starts no lower than the cell `*floor_cell` (device-visible memory, read when the kernel
-/// runs; KVA: the first draft cell built from a real row).  `window` may be INT_MAX for "every cell".  A floor of 0
-/// selects exactly what window_ids selects.  CUDA / HIP only.
-void window_ids_floor(int32_t* steps, int n, int window, int32_t* ids, int64_t ids_stride, const int32_t* floor_cell,
-                      void* stream);
 
 }  // namespace strata::kernels

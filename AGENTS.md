@@ -55,7 +55,7 @@ short version is:
    Useful flags (all of them: `strata launch --help`): `--family`, `--model-path` (files the user already has),
    `--data-dir`, `--context 32k|64k|128k`, `--vision off|on|gpu|cpu`, `--parallel N`, `--gpu 0,1`,
    `--access local|lan|cloudflare|tailscale`, `--port`, `--api-key-env NAME`, `--new-key`, `--save-preset NAME`,
-   `--speed faster|full` (DeepSeek), `--output json`. `strata launch --status` shows what is serving, `strata launch --stop` stops it, and
+   `--output json`. `strata launch --status` shows what is serving, `strata launch --stop` stops it, and
    `strata launch --show-key` prints the API key.
 4. Connect the user's apps: `strata connect` lists them, `strata connect <app> --check` sends one prompt and one tool
    call the way that app does.

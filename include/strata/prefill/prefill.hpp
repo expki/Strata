@@ -15,12 +15,16 @@
 #include "strata/core/layer.hpp"
 #include "strata/core/session.hpp"
 #include "strata/core/weights.hpp"
+#include "strata/prefill/expert_planner.hpp"
+#include "strata/prefill/tier_planner.hpp"
 
 #include <cstdint>
 #include <functional>
 #include <future>
 #include <memory>
+#include <mutex>
 #include <string>
+#include <vector>
 
 namespace strata::core { class PeerExperts; }
 namespace strata::kernels::cpu { class ExpertPool; }
@@ -44,6 +48,23 @@ struct PrefillStats {
 }  // namespace strata::prefill
 namespace strata::core { class MtpDrafter; }
 namespace strata::prefill {
+
+/// --peer-device hip:N: the AMD tier as the prompt planner sees it, one for all the stages that hand it rows.
+struct TierShare {
+    explicit TierShare(const planner::Rates& priors) : book(priors) {}
+    /// The tier's layers of one stage since its planner last reported: how many, their ms, and the ms the rates gave them.
+    struct Took { int64_t layers = 0; double ms = 0, fit = 0; };
+    std::mutex mu;            ///< guards book, calls, took, start, start_b, seen and times
+    planner::RateBook book;   ///< the tier's measured rates (its stage half is not used)
+    planner::StageCalls calls;   ///< each stage's two latest calls, by the index its tier calls name as their caller
+    std::vector<Took> took;   ///< one per stage, at the same index
+    std::vector<planner::TierStart> start;   ///< one per stage: the ms from its call queued to the tier's x seen (the calls ahead and the handoff)
+    std::vector<planner::TierStart> start_b; ///< one per stage: the same of its second halves' calls alone
+    planner::StageTimes times;               ///< each stage's chunk time on its GPU, so a faster stage knows its slack
+    /// STRATA_PREFILL_TIMING: a record of a stage's call, kept for that stage whichever stage read it.
+    struct Seen { uint32_t seq; double start_ms, ms; };
+    std::vector<std::vector<Seen>> seen;     ///< one per stage
+};
 
 /// HIP: one tiny BF16 and one tiny FP16 product on a private handle, so the first prompt does not pay hipBLAS's one-time
 /// library loads (about 2.5 s on an R9700); once per device, later calls wait for the first and return.  Safe to call from a
@@ -126,6 +147,8 @@ public:
     /// #340: the streamed ring's slot count for chunks that stream every expert, instead of the pinned-share rule
     /// (0 = that rule). Set before any `bytes_needed`/`init` (both count the ring); STRATA_PREFILL_RING still wins.
     static void set_ring_override(int slots);
+    /// One NVIDIA card beside the AMD tier with the whole pinned copy: the ring sized by each chunk (chunk_ring.hpp), set before bytes_needed.
+    static void set_ring_by_chunk(bool on);
     /// #583: the auto chunk scan's byte-budget ring, for chunks above `small_max` (0.1.39's auto chunk: a prompt that
     /// fits it keeps 0.1.39's ring).  0 slots = none.  A layer split's set_ring_override and STRATA_PREFILL_RING win.
     static void set_ring_budget(int slots, int64_t small_max);
@@ -164,6 +187,15 @@ public:
     /// keeps the ring full.  STRATA_RING_BYTES=0: 0.1.39's ring, loan and chunk list.
     static bool ring_bytes_enabled();
 
+    /// What the AMD tier's card gives its prompt buffers for chunks of `chunk` tokens of this pack's MMQ layers.
+    static uint64_t tier_prompt_bytes(int64_t chunk);
+    /// Whether an AMD tier can take prompt rows from this pack and build: set_peer's tests, read before the card fills.
+    static bool tier_prompt_ok();
+    /// The largest gate-up and down matrices the AMD tier's prompt kernels take for this pack.
+    static void tier_prompt_mats(uint64_t& gu, uint64_t& d);
+    /// The AMD tier's rings for this stage open now, on a thread of their own, not at the first chunk that streams.
+    void open_tier_stream();
+
     /// STRATA_MMQ_DIRECT: the guard each sized expert-cache slot keeps after its blob (ExpertCache::set_slot_guard),
     /// so the prompt MMQ can read a resident expert in its slot.  0 unless STRATA_MMQ_DIRECT is 1 or 2 on a CUDA
     /// build with the pointer-table MMQ (STRATA_MMQ_TAB).
@@ -184,6 +216,11 @@ public:
     /// rows per layer; the rest of the peer's experts are read by this GPU over P2P).  Allocates the peer's buffers for
     /// chunks of up to init's `chunk` tokens.  Needs P2P between the two cards.
     bool set_peer(core::PeerExperts* peer, int64_t cap_rows, std::string& err);
+
+    /// --peer-device hip:N, after set_peer: each chunk's tier-held experts split with this GPU by measured rates (`tier` is all stages').
+    void set_planner(std::shared_ptr<TierShare> tier, const planner::Rates& priors);
+    /// What this and the later stages' planners did since the last call as one log line, or "" without them (once a request).
+    std::string take_planner_report();
 
     /// Plan v0.3 P6: called after every chunk with the chunk's final multi-stream residual rows (device,
     /// T x hc*n_embd, valid until the next chunk) and the chunk's first position; the MTP draft layer builds its
@@ -214,10 +251,6 @@ public:
     /// for its grouping on the host; a policy may count them. Not called on the paths that keep the ids on the GPU.
     std::function<void(int64_t layer, const int32_t* ids, int64_t n)> on_routes;
     int64_t stopped_at() const { return stopped_at_; }
-    /// KVA: the end of the positions the last run approximated (they are a prefix: chunks from the run's first position
-    /// on), i.e. the first position whose final rows are real; 0 when that run approximated nothing.  Raised chunk by
-    /// chunk, before on_chunk reports the chunk, so the draft layer can skip the chunk's cells.  Reset by every run.
-    int64_t kva_floor() const { return kva_floor_; }
     /// Grows this stage's (and the later stages') pinned upload slots to what a text chunk of `T` tokens uploads, so
     /// a run of such chunks allocates no pinned memory (STRATA_PIPED_CONCURRENT: an allocation or free on the read's
     /// thread takes the driver's lock).  Before the run, with nothing of this path in flight.  False: a slot could
@@ -261,6 +294,8 @@ public:
     /// `by_default`: this path is one the share was measured on (CUDA, one GPU, no batch slots), so with the variable unset
     /// the share is on for chunks below 1024 tokens (STRATA_PREFILL_CPU_SHARE=0 turns it off).
     static void arm_cpu_share(bool applies, bool by_default = false);
+    /// A read beside decoding slots (STRATA_PIPED_CONCURRENT) says so: its threads keep off the workers' cores
+    static void set_beside_decode(bool on);
 
     /// Layer-major prefill (STRATA_PREFILL_LAYER_MAJOR=1): true while `on_chunk` reports a sub-chunk before the end of
     /// its super-chunk.  The session state is already at the super-chunk's end then, so no checkpoint may be taken.
@@ -298,8 +333,8 @@ private:
     Prefill* helper_ = nullptr;         ///< set_stage_helper
     bool single_chunk_ = false;         ///< a later stage: the prompt is one chunk (set by the stage before)
     int64_t stopped_at_ = -1;           ///< stop_at_chunk ended the last run after this many tokens (-1: it read all)
-    int64_t kva_floor_ = 0;             ///< kva_floor()
     bool pipe_chunked_ = false;         ///< a later stage: the chunks came from a --prefill-pipe plan (set likewise)
+    int64_t chunk_before_ = 0, chunk_after_ = 0, chunk_tokens_ = 0;   ///< a later stage: the run's chunks before and after the one handed on, and their size (set likewise)
     int64_t force_chunk_ = 0;           ///< force_chunk, for the next run (0: none)
     bool force_single_ = false, force_planned_ = false;
     bool bind_stage_helper(int64_t T);  // binds the helper's buffers for a one-chunk prompt of T tokens

@@ -36,9 +36,9 @@ SHA-256), so a PC that has one of them can link those two shards instead of down
 |---|---|---|---|---|---|---|---|
 | Q4_K (gate/up) | yes | FP16 path; MMQ with `STRATA_MMQ_KQ=1` | ggml AVX2 dot; multi-token AVX2 (`STRATA_KQ256=1`) | yes (CUDA layout; `STRATA_EXPERT_V2K=1` bitwise) | FP16 path; MMQ with `STRATA_MMQ_KQ=1`; gfx11 fused (`STRATA_PF_FUSED_KQ=1`) | kernels built, not run with these files | FP16 path |
 | Q5_K (gate/up) | yes | as Q4_K | ggml AVX2 dot | as Q4_K | as Q4_K | kernels built, not run with these files | FP16 path |
-| Q6_K (gate/up) | yes (since this change; was `-DSTRATA_Q6K_EXPERTS=ON`) | FP16 path; MMQ with `STRATA_MMQ_KQ=1` | ggml AVX2 dot | yes (CUDA layout) | FP16 path; MMQ with `STRATA_MMQ_KQ=1` | kernels built, not run with these files | FP16 path |
+| Q6_K (gate/up) | yes (since this change; was `-DSTRATA_Q6K_EXPERTS=ON`) | MMQ (`STRATA_MMQ_KQ=0`: FP16 path) | ggml AVX2 dot; multi-token AVX2 from 2 tokens | yes (CUDA layout) | MMQ (`STRATA_MMQ_KQ=0`: FP16 path) | kernels built, not run with these files | FP16 path |
 | Q5_1 (down) | yes | as Q4_K | ggml AVX2 dot; multi-token AVX2 (`STRATA_KQ256=1`) | yes (CUDA layout; V2K) | as Q4_K | kernels built, not run with these files | FP16 path |
-| Q8_0 (gate/up, down) | yes | MMQ | ggml AVX2 dot; multi-token AVX2 down (`STRATA_KQ256=1`) | yes (CUDA layout; V2K down) | MMQ | kernels built, not run with these files | FP16 path |
+| Q8_0 (gate/up, down) | yes | MMQ | ggml AVX2 dot; multi-token AVX2 down from 2 tokens | yes (CUDA layout; V2K down) | MMQ | kernels built, not run with these files | FP16 path |
 
 - "FP16 path": the prompt's experts dequantized to FP16 and multiplied by the BLAS library. It works for every format
   above but reads each expert as ~10 MB of FP16.
@@ -48,17 +48,18 @@ SHA-256), so a PC that has one of them can link those two shards instead of down
   +19 KB of sm_60 code, and the expert-cache slot counts measured unchanged (IQ3_XXS: 6,028 slots on a P100, 15,878
   and 1,980 on an R9700). The K-quant MMQ prompt kernels (Q4_K, Q5_K, Q5_1, Q6_K: ~3.8 MB of sm_60 code, 3 IQ3_XXS
   slots on the P100 when they were in the engine) are on CUDA a library of their own next to the engine
-  (`libstrata_kq.so` / `strata_kq.dll`), opened only for a model with these experts and `STRATA_MMQ_KQ=1`; without the
+  (`libstrata_kq.so` / `strata_kq.dll`), opened only for a model with these experts (Q6_K, or any of them with `STRATA_MMQ_KQ=1`); without the
   file those experts take the FP16 prompt path. On AMD a code object loads on first use, so they stay in the engine.
-- `STRATA_MMQ_KQ=1` is opt-in because MMQ rounds the prompt's products differently from the FP16 path (the output
-  differs at the rounding level); its speed and KL are measured before it becomes a default.
+- Q6_K goes through MMQ by itself, `STRATA_MMQ_KQ=0` turns it off. Q4_K, Q5_K and Q5_1 are opt-in with `STRATA_MMQ_KQ=1`
+  because MMQ rounds the prompt's products differently from the FP16 path (the output differs at the rounding level) and
+  their mean KL is worse on a few prompts (below).
 
 ## Quality: the yardstick
 
 `tools/quant_quality.py` scores a quant against Q8_0 on one fixed text set (`data/quant_quality/v1`: code, docs,
 English prose, German/French/Japanese/Chinese, an agent transcript; 5 x 1,000 tokens in `set.ids.json`). Every token
 is read through the decode windows (teacher-forced) with the experts on the CPU (one VRAM slot), no expert
-adaptation, no PCIe share, no route tail skip, FP16 K/V; per position the engine writes the log-probability of the
+adaptation, no PCIe share, FP16 K/V; per position the engine writes the log-probability of the
 text's next token and its 64 most likely tokens (`STRATA_LOGPOS`, `STRATA_LOGPOS_TOPK=64`). Top-1 agreement: the
 same most likely token as Q8_0. KL: KL(Q8_0 || quant) over Q8_0's 64 most likely tokens.
 
@@ -88,7 +89,12 @@ of 256-1,000 tokens of the set, the full vocabulary's KL of the next token's dis
 quant above picks Q8_0's top token after all 20 prompts. The K-quants' MMQ kernels (`STRATA_MMQ_KQ=1`) against the FP16
 path on the R9700: UD-Q4_K_XL mean KL 0.095 / median 0.0027 (FP16: 0.081 / 0.0047), UD-Q5_K_XL 0.038 / 0.00055 (FP16:
 0.025 / 0.0016), UD-Q6_K_XL 0.028 / 0.00029 (FP16: 0.029 / 0.00069) - a better median everywhere, a worse mean on Q4/Q5
-(a few prompts), so it stays opt-in.
+(a few prompts), so Q4/Q5 stay opt-in and Q6_K is on by itself.
+
+**Gate v2** is what `prompt` runs by default now: one unscored warm request, the 20 short prompts, 30 long ones of
+4,600 to 4,986 tokens (v1's 10 among them) and 7 xl prompts of 20,000 to 24,300 tokens from a frozen docs text and a
+frozen code file (`data/quant_quality/xl`). `pcompare --per-prompt` shows each prompt with the reference's entropy, and
+`gate REF RUN1 RUN2` passes only when every start passes every line (`--set v1` gives the old 30 prompts).
 
 ## Speed, and the bound
 
@@ -127,6 +133,17 @@ One token per expert (most of decode) is at the RAM bound on all three; older CP
 expert (ggml's dot decodes the weights once per token; `STRATA_KQ256=1`, bit-exact, takes 11-20% off Q4_K at 3-4
 tokens).
 
+Q6_K gate/up and Q8_0 down rows take the multi-token AVX2 kernels by default when two or more tokens of a verify window
+share an expert (one token keeps ggml's dot; `STRATA_NO_KQ_MT=1` keeps it for every token). They are ggml's AVX2 dots
+with the token loop inside, so every token's result is ggml's to the bit (`native_expert_parity` checks 1 to 8 tokens).
+Measured on an EPYC 7F52 (Zen 2, 16 cores, six DDR4-2133 channels), `kq_cpu_bench` Q6_K / Q8_0, one thread: 8.1 ->
+10.3 GB/s at 2 tokens, 5.8 -> 8.6 at 3, 4.6 -> 7.1 at 4 (1 token: 12.0 both); 8 threads at 4 tokens 35.3 -> 47.7 GB/s;
+15 threads are at the RAM bound either way (53-54 GB/s that run). The engine A/B (Swift 1.5 Q6_K, RTX 3090 at 1500 MHz
++ W6800 on its automatic clocks, the pinned RAM copy, two starts per build) did not resolve the kernel's own share: its
+chats read 33.1 / 28.1 / 21.9 -> 41.9 / 40.4 / 36.0 tok/s, but the slower build's starts had the W6800 below 1,000 MHz
+more often, and a start the same hour without this change or the decode look-ahead change read 35.7 on the chats
+(39.8 / 36.0 / 16.2 and 41.4 / 41.8 / 38.9).
+
 **Dense Q8_0 GEMVs** (`q8_gemv_bench`, the engine's shapes, 2-4 columns): one row per block where it was measured
 faster, the same bits as two (R9700: 2560 -> 10240 / 6144 / 12288 at 76-86% of 644 GB/s instead of 51-80%; RTX A4000:
 +1-4%, and 6144 -> 2560 at 6 columns 70% -> 76%). UD-Q4_K_XL decode +1.0-2.7% on the R9700, the same text.
@@ -155,11 +172,11 @@ old config's `--resident-budget-gib 71` holding the same experts read from the G
 story 39.5 -> 53.3 tok/s, code 60.1 -> 80.4, after a 6K document 49.0 -> 68.8, 5/5 each), prompt 4K x2.07, 6K x1.58,
 32K x1.03.
 
-**The route tail skip** (`STRATA_ROUTE_TAIL_SKIP=7`, the default since 0.1.42: a missed expert every token of a window
-routes at rank 7 or lower is skipped) costs these files more than the 2-3-bit packs: UD-Q4_K_XL's yardstick KL against
-Q8_0 goes from 0.056 to 0.086 with every expert in RAM (R9700, the auto cache) and from 0.053 to 0.115 in the RAM
-budget mode (A4000, 1,500 GPU slots), for +4-10% decode in RAM and +26-67% in the budget mode (5 pairs each).
-`STRATA_ROUTE_TAIL_SKIP=0` in a config's `"env"` turns it off.
+**The route tail skip is gone.** Builds from 0.1.42 skipped a missed expert that every token of a window routed at rank
+7 or lower (`STRATA_ROUTE_TAIL_SKIP`). The engine now computes every routed expert, and the switch only prints that it is gone. The old
+numbers, as history: on these files the skip moved UD-Q4_K_XL's yardstick KL against Q8_0 from 0.056 to 0.086 with
+every expert in RAM (R9700, the auto cache) and from 0.053 to 0.115 in the RAM budget mode (A4000, 1,500 GPU slots), for
++4-10% decode in RAM and +26-67% in the budget mode (5 pairs each).
 
 **The hyper-connections on NVIDIA:** the pack's `--compat-bf16` copy of the Q8_0 HC projections rounds them to BF16
 (and doubles their bytes). `STRATA_HC_Q8=1` reads the file's own Q8_0 instead (on AMD gfx12 it is the default): on the

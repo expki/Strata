@@ -14,6 +14,7 @@
 // `auto` takes the SMT siblings of the host's core, then every CPU of a physical core no worker is pinned to.  It
 // never takes a CPU that shares a core with a worker (that would steal the worker's cycles): with nothing spare the
 // feature does nothing.  A list (`--aux-cpus 24,26`) is taken as given, minus the host's CPU and the workers' CPUs.
+// Prompt-only threads run on every CPU but the host's (place_prompt_thread), and off the workers' CPUs while the pool can run (place_off_pool).
 //
 // Linux only (the other systems get empty functions).  Header-only on purpose: the callers sit in four libraries that
 // do not link each other.  No output of the engine depends on where a thread runs.
@@ -127,6 +128,24 @@ inline std::vector<int> restrict_list(const std::vector<int>& list, const std::v
     return out;
 }
 
+/// The CPUs a prompt-only thread may use: every allowed CPU but the host's, or all allowed when that leaves none
+inline std::vector<int> prompt_cpus(const std::vector<int>& allowed, int host_cpu) {
+    std::vector<int> out;
+    for (int c : allowed)
+        if (c != host_cpu) out.push_back(c);
+    return out.empty() ? allowed : out;
+}
+
+/// A prompt thread's CPUs while the pool can run: the aux set when it is on, else off the host's and workers' CPUs
+inline std::vector<int> off_pool_cpus(const std::vector<int>& allowed, int host_cpu, const std::vector<int>& workers,
+                                      const std::vector<int>& aux) {
+    if (!aux.empty()) return aux;
+    std::vector<int> out;
+    for (int c : allowed)
+        if (c != host_cpu && std::find(workers.begin(), workers.end(), c) == workers.end()) out.push_back(c);
+    return out.empty() ? prompt_cpus(allowed, host_cpu) : out;   // nothing spare: the workers' cores, never the host's
+}
+
 /// What `--aux-cpus` / STRATA_AUX_CPUS said.  `on`: placed from the start-up; `use_list`: the list, not `auto`.
 struct Config {
     bool on = false;
@@ -162,8 +181,9 @@ struct State {
     std::vector<int> workers;                     ///< the pool's CPUs: their threads are never touched
     int host_cpu = -1;                            ///< the CPU the host thread is pinned to (-1: unknown)
     cpu_set_t target;
-    std::set<int> owned;                          ///< tids of pool workers and host threads
+    std::set<int> owned;                          ///< tids of pool workers, host threads and prompt threads
     std::map<int, cpu_set_t> original;            ///< tid -> the mask it had before this module moved it
+    size_t purge_at = 64;                         ///< owned's size at which place_prompt_thread drops ended threads
     State() { CPU_ZERO(&target); }
 };
 
@@ -289,25 +309,11 @@ inline void set_enabled(bool on) {
 inline bool enabled() { return detail::state().enabled.load(std::memory_order_acquire); }
 
 namespace detail {
-/// The CPUs a thread that must not share the host's core runs on: every CPU the process may use but the host's and
-/// the pool workers' (on an SMT machine with the default pool, the idle sibling threads); without such CPUs, every CPU
-/// but the host's; failing that, every CPU.  Caller holds `mu`.  False when `configure` saw no CPUs.
-inline bool off_host_target_locked(const State& s, cpu_set_t& out) {
-    if (s.allowed.empty()) return false;
-    auto build = [&](bool skip_workers) {
-        CPU_ZERO(&out);
-        int n = 0;
-        for (int c : s.allowed) {
-            if (c == s.host_cpu) continue;
-            if (skip_workers && std::find(s.workers.begin(), s.workers.end(), c) != s.workers.end()) continue;
-            CPU_SET(c, &out);
-            ++n;
-        }
-        return n;
-    };
-    if (build(true) > 0 || build(false) > 0) return true;
+/// The CPUs of a thread that must not share the host's core: off_pool_cpus with `aux`.  Caller holds `mu`.
+inline bool off_host_target_locked(const State& s, cpu_set_t& out, const std::vector<int>& aux = {}) {
+    if (s.allowed.empty()) return false;   // configure saw no CPUs
     CPU_ZERO(&out);
-    for (int c : s.allowed) CPU_SET(c, &out);
+    for (int c : off_pool_cpus(s.allowed, s.host_cpu, s.workers, aux)) CPU_SET(c, &out);
     return true;
 }
 }  // namespace detail
@@ -323,9 +329,38 @@ inline bool place_off_host() {
     return sched_setaffinity(0, sizeof to, &to) == 0;
 }
 
-/// Called on the host thread: every other thread that runs on exactly the host's CPUs (it inherited them: the prefill
-/// copy threads started by the first prompt, a helper the host started) goes where place_off_host puts a thread.  The
-/// pool's workers and the host threads are never moved.  Returns how many moved.
+/// Moves the calling thread to prompt_cpus and marks it owned so a sweep leaves it alone (with or without a plan)
+inline void place_prompt_thread() {
+    detail::State& s = detail::state();
+    std::lock_guard<std::mutex> lk(s.mu);
+    const std::vector<int> cpus = prompt_cpus(s.allowed, s.host_cpu);
+    if (cpus.empty()) return;   // configure never ran
+    cpu_set_t to;
+    CPU_ZERO(&to);
+    for (int c : cpus) CPU_SET(c, &to);
+    if (sched_setaffinity(0, sizeof to, &to) != 0) return;
+    const int tid = detail::self_tid();
+    s.original.erase(tid);   // a restore must not put back the mask an earlier sweep found
+    s.owned.insert(tid);
+    if (s.owned.size() >= s.purge_at) {   // the threads of past prompts end, their tids are dropped now and then
+        detail::purge_locked(s);
+        s.purge_at = 2 * s.owned.size() + 64;
+    }
+}
+
+/// A prompt thread while the pool can run (a chunk holds it, or decode runs beside the read): see off_pool_cpus
+inline bool place_off_pool() {
+    detail::State& s = detail::state();
+    std::lock_guard<std::mutex> lk(s.mu);
+    cpu_set_t to;
+    const bool aux = s.enabled.load(std::memory_order_acquire);
+    if (!detail::off_host_target_locked(s, to, aux ? s.plan : std::vector<int>{})) return false;
+    return sched_setaffinity(0, sizeof to, &to) == 0;
+}
+
+/// Called on the host thread: every other thread that runs on exactly the host's CPUs (it inherited them: a helper the
+/// host started) goes where place_off_host puts a thread.  The pool's workers, the host threads and the prompt threads
+/// are never moved.  Returns how many moved.
 inline int release_host_inheritors() {
     detail::State& s = detail::state();
     std::lock_guard<std::mutex> lk(s.mu);
@@ -417,6 +452,8 @@ inline int restore() { return 0; }
 inline void set_enabled(bool) {}
 inline bool enabled() { return false; }
 inline bool place_off_host() { return false; }   // (a new thread does not inherit the host's CPU set here)
+inline void place_prompt_thread() {}
+inline bool place_off_pool() { return false; }
 inline int release_host_inheritors() { return 0; }
 inline std::vector<int> plan() { return {}; }
 inline std::string set_topology(int, const std::vector<int>&) { return "strata aux cpus: not available on this system"; }

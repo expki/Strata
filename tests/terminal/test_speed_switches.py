@@ -1,8 +1,10 @@
-"""The 0.2.7 speed features and their switches: the contract names, the defaults (Faster long prompts OFF, the other two ON), where each applies, and how the Terminal carries them.
+"""The 0.2.7 speed features and their switches: the contract names, the defaults (both ON), where each applies, and how the Terminal carries them.
+
+This fork removed two upstream rows: "Faster long prompts" (KVA) and "Faster answers on 12 GB NVIDIA cards" (the route prior); the tests say they stay gone.
 
 The app (apps/host/server/native-settings.mjs SPEED_SWITCHES) and Control (strata_control/speed_switches.py) say the same thing; the last test reads the
 app's table with node and fails when the two differ.  `strata launch` shows the environment entries as rows of its Advanced table and writes them into
-the run config's "env" (`--set STRATA_KVA=1` turns Faster long prompts on); a default launch has none of them.
+the run config's "env" (`--set STRATA_PCIE_FRAC_DEFAULT=old` turns the Radeon one off); a default launch has none of them.
 """
 from __future__ import annotations
 
@@ -20,14 +22,12 @@ from strata_control import speed_switches as W
 ROOT = Path(__file__).resolve().parents[2]
 
 ENV = {      # what each switch writes outside its default
-    "faster_long_prompts": {"STRATA_KVA": "1"},
-    "faster_12gb_nvidia": {"STRATA_ROUTE_PRIOR": "0"},
     "faster_radeon_9000": {"STRATA_PCIE_FRAC_DEFAULT": "old"},
     "deepseek_speedups": {"DS4_DEFAULTS": "026", "DS4_FAST_ATTN": "0", "DS4_ATTN_SLAB": "0", "DS4_COPY_PIN": "0", "DS4_COPY_HUGETLB": "0",
                           "DS4_STORE_SPARE": "0", "DS4_STORE_PUT": "0"},
     "qwen_defaults_026": {"STRATA_DEFAULTS": "026"},         # the Terminal's troubleshooting switch: not in the app
 }
-DEFAULT = {"faster_long_prompts": "off", "faster_12gb_nvidia": "on", "faster_radeon_9000": "on", "deepseek_speedups": "on", "qwen_defaults_026": "off"}
+DEFAULT = {"faster_radeon_9000": "on", "deepseek_speedups": "on", "qwen_defaults_026": "off"}
 SIX = ("DS4_FAST_ATTN", "DS4_ATTN_SLAB", "DS4_COPY_PIN", "DS4_COPY_HUGETLB", "DS4_STORE_SPARE", "DS4_STORE_PUT")
 RTX3060 = {"name": "NVIDIA GeForce RTX 3060", "vendor": "nvidia", "arch": "86", "vram_gb": 12.0}
 RTX4070S = {"name": "NVIDIA GeForce RTX 4070 SUPER", "vendor": "nvidia", "arch": "89", "vram_gb": 12.0}
@@ -48,7 +48,7 @@ def ids(cfg, gpus, backend=None):
 
 
 class Contract(unittest.TestCase):
-    def test_five_switches_with_the_contract_names_and_their_defaults(self):
+    def test_three_switches_with_the_contract_names_and_their_defaults(self):
         self.assertEqual([s.id for s in W.SWITCHES], list(ENV))
         for s in W.SWITCHES:
             self.assertEqual(dict(s.env), ENV[s.id], s.id)
@@ -59,49 +59,28 @@ class Contract(unittest.TestCase):
             if not s.terminal_only:
                 self.assertRegex(s.effect, r"Off by default" if s.default == "off" else r"[Tt]urn off", s.id)
             self.assertNotRegex(s.effect, r"STRATA_|DS4_|--|env", s.id)
-        self.assertEqual(W.SWITCHES[0].effect, "Reads very long prompts faster by approximating part of the work. Off by default: answers about long documents can miss or mix up details.")
+
+    def test_the_removed_rows_stay_gone(self):
+        for gone in ("faster_long_prompts", "faster_12gb_nvidia"):
+            self.assertNotIn(gone, W.BY_ID)
+        for name in ("STRATA_KVA", "STRATA_ROUTE_PRIOR"):
+            self.assertNotIn(name, W.env_names())
+        self.assertEqual(ids(QWEN, [RTX3060]), [], "no row for a 12 GB NVIDIA card")
 
     def test_where_each_switch_applies(self):
-        self.assertEqual(ids(QWEN, [RTX]), ["faster_long_prompts"])
-        self.assertEqual(ids({**QWEN, "backend": "hip"}, [RX7900]), ["faster_long_prompts"])
-        self.assertEqual(ids({**QWEN, "backend": "hip"}, [STRIX]), ["faster_long_prompts"], "Strix Halo is gfx1151, not gfx12")
-        self.assertEqual(ids({**QWEN, "backend": "hip"}, [R9700]), ["faster_long_prompts", "faster_radeon_9000"])
-        self.assertEqual(ids({"model_name": "qwen3.8-flash-next-iq3_s"}, [R9700], "hip"), ["faster_long_prompts", "faster_radeon_9000"], "the installed engine's backend when the config has none")
-        self.assertEqual(ids({**QWEN, "backend": "hip"}, [{"name": "AMD Radeon RX 9070 XT", "vendor": "amd"}]), ["faster_long_prompts", "faster_radeon_9000"])
-        self.assertEqual(ids({**QWEN, "backend": "cuda"}, [RTX, R9700]), ["faster_long_prompts"], "the Radeon switch needs the HIP engine")
+        self.assertEqual(ids(QWEN, [RTX]), [])
+        self.assertEqual(ids({**QWEN, "backend": "hip"}, [RX7900]), [])
+        self.assertEqual(ids({**QWEN, "backend": "hip"}, [STRIX]), [], "Strix Halo is gfx1151, not gfx12")
+        self.assertEqual(ids({**QWEN, "backend": "hip"}, [R9700]), ["faster_radeon_9000"])
+        self.assertEqual(ids({"model_name": "qwen3.8-flash-next-iq3_s"}, [R9700], "hip"), ["faster_radeon_9000"], "the installed engine's backend when the config has none")
+        self.assertEqual(ids({**QWEN, "backend": "hip"}, [{"name": "AMD Radeon RX 9070 XT", "vendor": "amd"}]), ["faster_radeon_9000"])
+        self.assertEqual(ids({**QWEN, "backend": "cuda"}, [RTX, R9700]), [], "the Radeon switch needs the HIP engine")
+        self.assertEqual(ids({**QWEN36, "backend": "hip"}, [R9700]), ["faster_radeon_9000"], "the Radeon switch is not tied to the model's shape")
         for backend in ("sycl", "metal", "cpu", None):
             self.assertEqual(ids({**QWEN, "backend": backend}, [R9700]), [], backend)
         self.assertEqual(ids(DEEPSEEK, [R9700]), ["deepseek_speedups"])
         self.assertEqual(ids({**DEEPSEEK, "backend": "cuda"}, [RTX]), ["deepseek_speedups"])
         self.assertEqual(ids({"exe": "C:/x/strata-dsv41.exe"}, [RTX]), ["deepseek_speedups"], "found by the engine's name too")
-
-    def test_faster_answers_on_12gb_nvidia_cards_only_where_the_engine_routing_default_applies(self):
-        """The engine turns residency-biased routing on by default on a DISCRETE NVIDIA card of 13 GiB or less in a CUDA build (the Flash-Next shape)."""
-        self.assertEqual(ids(QWEN, [RTX3060]), ["faster_long_prompts", "faster_12gb_nvidia"])
-        self.assertEqual(ids(QWEN, [RTX4070S]), ["faster_long_prompts", "faster_12gb_nvidia"])
-        self.assertEqual(ids(QWEN, [{**RTX3060, "vram_gb": 13.0}]), ["faster_long_prompts", "faster_12gb_nvidia"], "13 GiB counts")
-        self.assertEqual(ids(QWEN, [{**RTX3060, "vram_gb": 13.5}]), ["faster_long_prompts"])
-        self.assertEqual(ids(QWEN, [RTX4060TI16]), ["faster_long_prompts"], "16 GB is not a 12 GB card")
-        self.assertEqual(ids(QWEN, [RTX]), ["faster_long_prompts"])
-        self.assertEqual(ids(QWEN, [RTX3060, RTX]), ["faster_long_prompts", "faster_12gb_nvidia"], "one small card among others")
-        self.assertEqual(ids(QWEN, [{**RTX3060, "uma": True}]), ["faster_long_prompts"], "not a chip that shares system memory")
-        self.assertEqual(ids(QWEN, [{**RTX3060, "integrated": True}]), ["faster_long_prompts"])
-        self.assertEqual(ids(QWEN, [{**RTX3060, "usable": False}]), ["faster_long_prompts"])
-        self.assertEqual(ids({**QWEN, "backend": "hip"}, [{"name": "AMD Radeon RX 7700 XT", "vendor": "amd", "arch": "gfx1101", "vram_gb": 12.0}]), ["faster_long_prompts"], "not a Radeon")
-        self.assertEqual(ids({**QWEN, "backend": "sycl"}, [RTX3060]), [], "not a CUDA build")
-        self.assertEqual(ids(QWEN36, [RTX3060]), [], "Qwen3.6-35B-A3B: the routing needs 512 experts")
-        self.assertEqual(ids(DEEPSEEK, [RTX3060]), ["deepseek_speedups"])
-        self.assertEqual(ids(QWEN, [{"name": "GeForce RTX 3060", "vram_gb": 12.0}]), ["faster_long_prompts", "faster_12gb_nvidia"], "no vendor reported: the name decides")
-        self.assertEqual(ids(QWEN, [{"name": "Mystery card", "vram_gb": 12.0}]), ["faster_long_prompts"])
-
-    def test_the_12gb_switch_off_writes_route_prior_zero_and_on_removes_it(self):
-        env = {"PATH": "/bin"}
-        off = W.set_switch(env, "faster_12gb_nvidia", False)
-        self.assertEqual(off, {"PATH": "/bin", "STRATA_ROUTE_PRIOR": "0"})
-        self.assertFalse(W.is_on(off, "faster_12gb_nvidia"))
-        self.assertTrue(W.is_on({}, "faster_12gb_nvidia"))
-        self.assertEqual(W.set_switch(off, "faster_12gb_nvidia", True), env)
-        self.assertTrue(W.is_on({"STRATA_ROUTE_PRIOR": "2.0"}, "faster_12gb_nvidia"), "any other value is the user's own and reads as the default")
 
     def test_deepseek_off_writes_the_master_switch_and_the_six_and_on_removes_all_seven(self):
         env = {"DS4_ASYNC_T": "4"}
@@ -128,32 +107,17 @@ class Contract(unittest.TestCase):
         self.assertFalse(W.is_on({}, sw))
         self.assertEqual(W.set_switch({"STRATA_DEFAULTS": "026"}, sw, False), {})
 
-    def test_faster_long_prompts_is_for_qwen38_flash_next_only(self):
-        """KVA was measured on the 48-layer / 512-expert Flash-Next shape and the engine declines other shapes: no row for Qwen3.6-35B-A3B (arch qwen35moe) or DeepSeek."""
-        self.assertEqual(ids(QWEN36, [RTX]), [], "Qwen3.6-35B-A3B on CUDA: no KVA row")
-        self.assertEqual(ids({**QWEN36, "backend": "hip"}, [RX7900]), [], "on HIP too")
-        self.assertEqual(ids({**QWEN36, "backend": "hip"}, [R9700]), ["faster_radeon_9000"], "the Radeon switch is not tied to the model's shape")
-        for family in ("qwen3.8-flash-next-iq3_s", "swift-1.5-iq3_s", "qwen3.8-flash-next-coder-iq3_s", "qwen3.8-flash-next-unsloth-ud-q4_k_xl",
-                       "qwen3.8-flash-next-gyro-gyro-s", "qwen3.8-flash-next-nvfp4-nvfp4"):
-            self.assertEqual(ids({**QWEN, "model_name": family}, [RTX]), ["faster_long_prompts"], family)
-        self.assertEqual(ids(DEEPSEEK, [RTX]), ["deepseek_speedups"])
-
     def test_outside_the_default_and_back_is_the_identical_environment(self):
         env = {"PATH": "/bin", "STRATA_PREFILL": "2", "DS4_ASYNC_T": "4"}
         for s in W.SWITCHES:
-            other = W.set_switch(env, s, s.default != "on")           # KVA on, the other two off
+            other = W.set_switch(env, s, s.default != "on")           # each one out of its default
             self.assertEqual(other, {**env, **ENV[s.id]})
             self.assertTrue(W.is_set(other, s))
             self.assertEqual(W.is_on(other, s), s.default != "on")
             back = W.set_switch(other, s, s.default == "on")
             self.assertEqual(json.dumps(back), json.dumps(env), s.id)
 
-    def test_kva_is_off_by_default_and_an_earlier_builds_zero_shows_as_off(self):
-        self.assertFalse(W.is_on({}, "faster_long_prompts"))
-        self.assertTrue(W.is_on({"STRATA_KVA": "1"}, "faster_long_prompts"))
-        self.assertFalse(W.is_on({"STRATA_KVA": "0"}, "faster_long_prompts"), "stored by the old off switch: harmless, and Off is what it is now")
-        self.assertFalse(W.is_on({"STRATA_KVA": "yes"}, "faster_long_prompts"), "only 1 turns it on")
-        self.assertEqual(W.set_switch({"PATH": "/bin", "STRATA_KVA": "0"}, "faster_long_prompts", False), {"PATH": "/bin"}, "choosing Off cleans it up")
+    def test_deepseek_is_on_by_default(self):
         self.assertTrue(W.is_on({}, "deepseek_speedups"))
         self.assertTrue(W.is_on({"DS4_FAST_ATTN": "0"}, "deepseek_speedups"), "only some of the entries reads as the default (on)")
 
@@ -173,28 +137,26 @@ class Terminal(unittest.TestCase):
             self.assertEqual(json.dumps(self.config(base), sort_keys=True), json.dumps(self.config(base, {}), sort_keys=True))
 
     def test_each_switch_outside_its_default_by_set_gives_exactly_its_entries(self):
-        for sid, entries in ENV.items():          # --set STRATA_KVA=1 turns KVA on; the other two are turned off by their entries
+        for sid, entries in ENV.items():          # each one is moved out of its default by its entries
             base = DEEPSEEK if sid == "deepseek_speedups" else QWEN
             cfg = self.config(base, S.settings_from_pairs([f"{k}={v}" for k, v in entries.items()]))
             self.assertEqual(cfg["env"], {**base["env"], **entries}, sid)
             self.assertEqual(cfg["args"], base["args"], "no engine flag changes")
 
     def test_off_again_puts_the_default_back(self):
-        cfg = self.config(QWEN, S.settings_from_pairs(["STRATA_KVA=off"]))
+        cfg = self.config(QWEN, S.settings_from_pairs(["STRATA_DEFAULTS=off"]))
         self.assertEqual(cfg["env"], QWEN["env"])
-        turned_on = {**QWEN, "env": {**QWEN["env"], "STRATA_KVA": "1"}}
-        self.assertEqual(self.config(turned_on, S.settings_from_pairs(["STRATA_KVA=off"]))["env"], QWEN["env"])
-        old = {**QWEN, "env": {**QWEN["env"], "STRATA_KVA": "0"}}
-        self.assertEqual(self.config(old, S.settings_from_pairs(["STRATA_KVA=off"]))["env"], QWEN["env"])
+        turned_on = {**QWEN, "env": {**QWEN["env"], "STRATA_DEFAULTS": "026"}}
+        self.assertEqual(self.config(turned_on, S.settings_from_pairs(["STRATA_DEFAULTS=off"]))["env"], QWEN["env"])
 
     def test_the_advanced_table_lists_only_the_switches_that_apply(self):
         def names(cfg, gpus, extra=None):
             rows = P.build_rows(None, cfg["args"], None, cfg["env"], None, extra or {}, P.switch_params(W.applicable(cfg, gpus)))
             return [r.name for r in rows if r.name in W.env_names()]
         # (STRATA_DEFAULTS, the Qwen "0.2.6 behaviour" row, closes every Qwen table; the DeepSeek table has DS4_DEFAULTS instead)
-        self.assertEqual(names(QWEN, [RTX]), ["STRATA_KVA", "STRATA_DEFAULTS"])
-        self.assertEqual(names(QWEN, [RTX3060]), ["STRATA_KVA", "STRATA_ROUTE_PRIOR", "STRATA_DEFAULTS"])
-        self.assertEqual(names({**QWEN, "backend": "hip"}, [R9700]), ["STRATA_KVA", "STRATA_PCIE_FRAC_DEFAULT", "STRATA_DEFAULTS"])
+        self.assertEqual(names(QWEN, [RTX]), ["STRATA_DEFAULTS"])
+        self.assertEqual(names(QWEN, [RTX3060]), ["STRATA_DEFAULTS"])
+        self.assertEqual(names({**QWEN, "backend": "hip"}, [R9700]), ["STRATA_PCIE_FRAC_DEFAULT", "STRATA_DEFAULTS"])
         self.assertEqual(names(DEEPSEEK, [R9700]), list(ENV["deepseek_speedups"]), "the master switch and the six, in the contract order")
         self.assertEqual(names({**QWEN, "backend": "sycl"}, [R9700]), ["STRATA_DEFAULTS"])
         self.assertEqual(names(QWEN36, [RTX]), ["STRATA_DEFAULTS"])
@@ -210,14 +172,6 @@ class Terminal(unittest.TestCase):
         self.assertEqual(derive_config(QWEN, S.LaunchSettings(), bool_flags=frozenset())["env"], QWEN["env"], "a default launch carries nothing")
 
     def test_a_row_shows_its_default_until_it_is_changed_and_explains_itself(self):
-        rows = P.build_rows(None, QWEN["args"], None, QWEN["env"], None, {}, P.switch_params(W.applicable(QWEN, [RTX])))
-        row = next(r for r in rows if r.name == "STRATA_KVA")
-        self.assertEqual((row.name, row.default, row.tuned, row.yours, row.known), ("STRATA_KVA", "off", "off", "", True))
-        self.assertIn("Faster long prompts", row.description)
-        self.assertIn("off by default; set 1 to turn on", row.description)
-        self.assertIn("answers about long documents can miss or mix up details", row.description)
-        on = P.build_rows(None, QWEN["args"], None, QWEN["env"], None, {"STRATA_KVA": "1"}, P.switch_params(W.applicable(QWEN, [RTX])))
-        self.assertEqual(next(r for r in on if r.name == "STRATA_KVA").yours, "1")
         hip = {**QWEN, "backend": "hip"}
         radeon = next(r for r in P.build_rows(None, hip["args"], None, hip["env"], None, {}, P.switch_params(W.applicable(hip, [R9700]))) if r.name == "STRATA_PCIE_FRAC_DEFAULT")
         self.assertEqual(radeon.default, "on")

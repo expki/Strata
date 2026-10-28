@@ -23,7 +23,9 @@ Source checkout on Linux ([SOURCE_INSTALL.md](SOURCE_INSTALL.md#amd-cards)):
 ```
 
 Setup picks `--backend hip` by itself on a PC with no NVIDIA card Strata can use. Other AMD architectures and mixed AMD/NVIDIA
-runs are not supported. Use the [package table](#ready-made-packages) to match your card.
+runs are not supported, with one experimental exception on Linux: the NVIDIA engine can keep part of a model's experts on
+one AMD card and let that card compute them. See [NVIDIA and AMD together](MULTI_GPU.md#nvidia-and-amd-together-experimental).
+Use the [package table](#ready-made-packages) to match your card.
 
 ## Supported cards
 

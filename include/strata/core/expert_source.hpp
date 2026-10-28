@@ -36,6 +36,7 @@
 #include <cstddef>
 #include <condition_variable>
 #include <deque>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <thread>
@@ -165,6 +166,10 @@ int64_t append_stage_lend_regions(int64_t n_layers, int64_t n_expert, const std:
                                   std::vector<uint64_t>& offsets, uint64_t& bytes, uint64_t cap_bytes,
                                   const std::vector<std::vector<std::pair<int32_t, int32_t>>>& regions,
                                   std::string& err);
+
+/// The plan in layer order with each layer on a page boundary, returning the n_layers + 1 layer starts (the last is `bytes`).
+std::vector<uint64_t> page_align_layers(int64_t n_layers, int64_t n_expert, const std::vector<uint64_t>& layer_blob_bytes,
+                                        std::vector<uint64_t>& offsets, uint64_t& bytes, uint64_t page = 4096);
 
 }  // namespace detail
 
@@ -607,10 +612,6 @@ struct ExpertDispatch {
     /// #588: routed (token, expert) entries the GPU computed from outside its cache in verify windows: read over PCIe
     /// (--pcie-frac, kind 1) or on another GPU (kind 2).  In neither cache_hits nor cache_refused.
     int64_t offload_entries = 0;
-    /// STRATA_ROUTE_TAIL_SKIP=R: entries skipped (a missed expert every token of the window routes only at rank >= R)
-    /// and the distinct experts behind them (neither copied nor computed)
-    int64_t tail_skipped = 0;
-    int64_t tail_experts = 0;
     double ms_plan = 0, ms_actq = 0, ms_jobs = 0, ms_run = 0;   ///< verify-window dispatch sections
     /// 149-cold STRATA_COLD_OVERLAP: 0 off (the CPU starts once every blob of the layer is read), 1 the blobs that
     /// must be read are read in the background while the pool computes the ready experts, each landed one computed
@@ -666,9 +667,6 @@ void expert_pool_dispatch(void* user, const float* x_f, const int32_t* ids, cons
 /// Plan v0.3 P6: the pool for a verify window of `n_tok` tokens.  `x_f` is (n_tok, n_embd), `ids` (n_tok, k) and
 /// `out` (n_tok * k, n_embd).  Each distinct missed expert is computed once for all the tokens routed to it;
 /// resident experts' rows are zeroed (the GPU adds them).  Requires `host_res` (the token-graph residency).
-/// STRATA_ROUTE_TAIL_SKIP rank (0: off).  Unset in the environment: 0 until the serve start-up sets the default.
-int tail_skip_rank();
-void set_tail_skip_rank(int r);
 
 void expert_pool_dispatch_multi(ExpertDispatch& d, const float* x_f, const int32_t* ids, int64_t n_tok, int64_t k,
                                 float* out, strata::kernels::cpu::NativeArithmetic arithmetic = strata::kernels::cpu::NativeArithmetic::Default);
@@ -767,6 +765,16 @@ public:
     uint64_t locked_bytes() const { return complement_locked_; }
     /// Lend-region slots whose experts the compact copy holds (the last ones of the cache).
     int64_t resident_lent_slots() const { return complement_lent_slots_; }
+    /// How the page-locked copy was filled when it went layer by layer (Linux, CUDA).
+    struct CopyFill {
+        bool by_layer = false;      ///< false: the single cudaHostAlloc path (STRATA_PIN_ALLOC=host, a budget, a split)
+        int64_t experts = 0;
+        double seconds = 0;         ///< from the first layer to the last registration
+        double register_s = 0;      ///< of it, in cudaHostRegister
+        uint64_t drive_bytes = 0;   ///< read with O_DIRECT (the experts the page cache did not hold)
+        double spread_s = -1;       ///< the fill threads' time spreading the pages, per thread (-1: STRATA_COPY_SPREAD=0)
+    };
+    const CopyFill& copy_fill() const { return copy_fill_; }
 
     // ---- the resident RAM mode and the adaptive tier.  A swap puts `in` (held here) into a GPU slot and evicts
     // `out` (held only by that slot).  Before the slot is overwritten the caller copies it back into an exchange
@@ -932,6 +940,8 @@ public:
     bool wants_scores() const override { return io_sched_ && io_pf_; }
     /// Not when the reads are unbuffered: the warmed pages would be read through the file cache, a second time.
     bool warms() const override { return (!role_ptr_.empty() || io_pf_) && direct_.empty(); }
+    /// Every expert no GPU holds is in the RAM copy or the page cache (four pages a span), false where that cannot be asked.
+    bool all_resident(const std::function<bool(int32_t, int32_t)>& gpu_held) const;
     /// Of the blobs the file tier read for the decode, how many had been warmed for their layer beforehand.
     int64_t warmed_hits() const { return warm_hits_.load(std::memory_order_relaxed); }
     int64_t warmed() const { return warm_count_.load(std::memory_order_relaxed); }
@@ -1056,8 +1066,15 @@ private:
     double async_fill_us_ = 0;
     /// #286: the blobs from the drive, unbuffered: every role's 4 KiB-aligned window is read at once (overlapped on
     /// Windows, io_submit on Linux) into this thread's aligned buffer, then copied into place.  False when a read fails.
-    bool read_direct(const Fill* fills, size_t n) const;
+    /// `fds`: the O_DIRECT descriptors to read with (the copy's own), else the file tier's.
+    bool read_direct(const Fill* fills, size_t n, const std::vector<void*>* fds = nullptr) const;
     bool open_direct(std::string& why);
+    /// The layer-order copy filled into `host` and registered layer by layer, false when a read fails.
+    bool fill_by_layer(const std::vector<uint64_t>& offsets, uint8_t* host, const std::vector<uint64_t>& starts,
+                       uint64_t reserve, uint64_t& registered, std::vector<uint64_t>& reg_starts, std::string& note,
+                       std::string& err);
+    /// The file pages of the layer's copied experts given back (the mapping's and the page cache's).
+    void drop_copied_pages(int64_t layer, const std::vector<uint64_t>& offsets) const;
     /// Windows: experts.bin mapped again as `open` maps it (begin/end_startup_unbuffered).
     bool map_view(std::string& why);
     std::vector<std::string> paths_;          ///< the mapped files, as maps_
@@ -1204,6 +1221,9 @@ private:
     uint64_t complement_lock_off_ = 0;        ///< the working-set lock covers [lock_off, lock_off + locked)
     bool complement_ready_ = false;
     uint64_t complement_locked_ = 0;          ///< bytes held in the working set (pin refused)
+    uint64_t complement_map_bytes_ = 0;       ///< the layer-order copy: its anonymous mapping (munmap, not free)
+    std::vector<uint64_t> complement_reg_starts_;   ///< the layer-order copy: each registered layer's start
+    CopyFill copy_fill_;
     int64_t complement_lent_slots_ = 0;
     std::vector<std::vector<std::pair<int32_t, int32_t>>> stage_lend_regions_;  ///< a split: each stage's lend region
     std::vector<const uint8_t*> override_;    ///< staged exchanges: an evicted expert read from its exchange buffer

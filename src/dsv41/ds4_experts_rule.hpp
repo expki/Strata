@@ -1,9 +1,4 @@
-// Strata. Experts per word: the "faster mode" rule of the DeepSeek V4.1 engine.  Header only, no GPU code (tests/dsv41/experts_rule_test.cpp).
-//
-// The model routes every word to its top 6 experts.  On a PC with a small graphics card the CPU lane and the SSD set the speed, and
-// each expert dropped saves their bytes: the router's top N are kept and their weights renormalised (the same selection the full
-// model makes, a shorter list).  The default is 5 where the graphics memory is 16 GiB or less, or the GPU shares the PC's RAM, the model's own count elsewhere;
-// --experts N says it outright (--experts 6: full quality), DS4_TOPK=N is the test override over everything.
+// Strata. DeepSeek V4.1's load-time rules (the prompt chunk, the RAM copy of the CPU lane's experts), header only, tested by tests/dsv41/experts_rule_test.cpp.
 #pragma once
 
 #include <cstdint>
@@ -15,9 +10,9 @@ namespace strata::ds4 {
 
 // DS4_DEFAULTS=026: the master switch.  Every default the DeepSeek engine changed since v0.2.6 goes back to what v0.2.6 did, so "off" in the app's
 // "DeepSeek speed-ups" really is version 0.2.6.  Each rule below takes `v026` (the engine passes defaults_026()); an explicit per-feature variable or
-// flag (DS4_ATTN_SLAB=N, DS4_COPY_PIN=1, DS4_FAST_ATTN=1, --experts N, --prefill-chunk N, ...) still wins over it.  The list, from
+// flag (DS4_ATTN_SLAB=N, DS4_COPY_PIN=1, DS4_FAST_ATTN=1, --prefill-chunk N, ...) still wins over it.  The list, from
 // `git diff v0.2.6..f-027-int2 -- src/dsv41`: the staging ring, the prompt chunk rule, the attention slab (base and growth), the pinned copy,
-// the huge-page arena, the matrix-core attention, the drafter's cumulative cut, the 5-experts default, the store's spare slots and put, the
+// the huge-page arena, the matrix-core attention, the drafter's cumulative cut, the store's spare slots and put, the
 // store settle after a prompt, the dense dequantizer, the F16 gate/up operand, the markov head in Q8, the head's column count, the RDNA3 WMMA GEMM.
 inline bool is_026_token(const char* v) {
     return v != nullptr && (std::strcmp(v, "026") == 0 || std::strcmp(v, "0.2.6") == 0 || std::strcmp(v, "v0.2.6") == 0);
@@ -27,24 +22,7 @@ inline bool defaults_026() {
     return on;
 }
 
-constexpr uint64_t kFasterModeVramMax = 16ull << 30;   // GiB of graphics memory in all, at most
-constexpr int kFasterModeExperts = 5;
-
-// requested: --experts (-1: not given, the rule decides); vram_bytes: the total memory of the cards the engine uses;
-// model_k: the experts a word takes in the model; integrated: a GPU that shares the PC's RAM (Strix Halo: part of the experts live only on
-// the SSD, each expert dropped is less read - measured 5 against 6 on a Radeon 8065S: decode +11..13%, prompts +5..7%).  The result is in 1 .. model_k.
-// multi_rdna4: two or more RDNA4 cards (gfx1200 / gfx1201: R9700, RX 9000) that together hold at least half of the routed experts - the 4 x R9700 box
-// the Marlin stream measured: 5 against 6 experts, 2.25 bpw, 8K prompt 1339 -> 1419 ppts (+6%) and decode 78.1 -> 81.2 tok/s (+4%), reference KL
-// 0.10987 against 0.10833 and top-1 87.59% against 87.53% (the gate is 0.006).  Faster mode there too, by default.
-inline int experts_per_word(int requested, uint64_t vram_bytes, int model_k, bool integrated = false, bool multi_rdna4 = false,
-                            bool v026 = false) {
-    if (model_k <= 1) return model_k;
-    if (v026) multi_rdna4 = false;   // 0.2.6: Faster by default on a small card or an integrated GPU only
-    int n = requested;
-    if (n < 1) n = integrated || multi_rdna4 || (vram_bytes != 0 && vram_bytes <= kFasterModeVramMax) ? kFasterModeExperts : model_k;
-    if (n > model_k) n = model_k;
-    return n < 1 ? 1 : n;
-}
+// Faster mode (the 5-experts default) is removed: every word takes all its routed experts.
 
 // Prompt chunk (--prefill-chunk) default, one rule decided once at load from bytes (no timing).  The chunk's buffers come out of the VRAM the
 // expert tier would have, and every chunk streams the experts the cards do not hold once, so a bigger chunk is fewer passes.  Measured (8K prompt):
@@ -143,16 +121,6 @@ inline int staging_ring_mb(double share, double room_bytes, int n_dev, bool inte
     if (share >= 0.5) return (int) std::min(512.0, std::max(128.0, per_dev / GB * 8.0));
     return (int) streamed;
 }
-
-// DS4_TOPK=N (a test, not for users): over the flag and the rule; returns the count to use
-inline int experts_test_override(int chosen, int model_k) {
-    if (const char* v = std::getenv("DS4_TOPK")) {
-        const int n = std::atoi(v);
-        if (n >= 1 && n <= model_k) return n;
-    }
-    return chosen;
-}
-
 
 // The base of the attention slab, MB of q (rows = MB / the heads' width, rounded to 64): STRATA_DS4_A_MB when given; 0.2.6 and a discrete card 8 MB;
 // a unified-memory GPU 32 MB (main's 3133160ed, Strix Halo).

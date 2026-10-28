@@ -32,6 +32,8 @@ bool gr_upmix(const uint16_t* lo16, const uint16_t* w_up, const float* R, const 
 void gr_write_norm_rs(float* R, const float* bo, const float* inj, int64_t inj_ld, const float* w_norm_next, float eps,
                       float* rs, uint16_t* xn16, int64_t T, void* stream, uint16_t* xn16_lo = nullptr,
                       int64_t ldx = 0, bool f16img = false);
+/// gr_mix_r and gr_write_norm_rs run float4 kernels with the same bits (STRATA_HC_VEC=0: the scalar ones), and tests pass 0 scalar, 1 vector or -1 the env.
+void set_hc_vec(int mode);
 /// S23 (STRATA_CVEC_FUSE=1): gr_write, then the control vector (v_l = layer l's direction row, *s_l its scale,
 /// *on the request flag, mode 0 project / 1 add; cvec_kernel's arithmetic), then gr_norm_rs with the next half's
 /// norm - one pass over R, the same bits as the three kernels.
@@ -75,12 +77,6 @@ void gdn_recurrence(float* state, const float* h, const float* gate, const float
 void gdn_recurrence_variant(int variant, float* state, const float* h, const float* gate, const float* beta,
                             const float* z, const float* gamma, float eps, float* y, uint16_t* y16, int64_t T,
                             void* stream, int64_t ld16 = 0);
-/// KVA (CUDA/HIP only): the same recurrence kernels as gdn_recurrence, bit for bit, without the output
-/// normalization: state, h, gate, beta and the scratch `y` only.  The output projection and the gated residual
-/// write have no consumer when only the state advances, and their input (z, the gate projection) is not needed
-/// either.  Declared here for the CUDA build; the SYCL tree keeps its own recurrence and does not reference it.
-void gdn_recurrence_state_only(float* state, const float* h, const float* gate, const float* beta, float* y,
-                               int64_t T, void* stream);
 
 // ---- MoE
 /// softmax over 512, top-10 (ties to the lower id), weights renormalised over the ten (the native router).
@@ -129,6 +125,21 @@ void peer_gather_add(float* sum, const float* rows, int64_t r0, const float* wk,
 /// moe_combine_peer with the peer's sums in FP16 (`peer16`, may be mapped host memory)
 void moe_combine_peer16(const float* D, const int32_t* slot, const float* w, const float* shared, const float* sg,
                         const uint16_t* peer16, int64_t rows_local, float* bo, int64_t T, void* stream);
+/// The combine kernels' experts per token and row width, which the prompt path's K and N must equal.
+inline constexpr int64_t kCombineTop = 10, kCombineWidth = 2560;
+/// Tokens [t0, t0 + n) of a chunk's MoE combine at their rows of every table, with the tier's sums (FP16 with f16) or without them (null).
+inline void moe_combine_rows(const float* D, const int32_t* slot, const float* w, const float* shared, const float* sg, const void* sums,
+                             bool f16, int64_t rows_local, const float* row_sd, float* bo, int64_t t0, int64_t n, void* stream) {
+    constexpr int64_t k = kCombineTop, width = kCombineWidth;
+    if (sums == nullptr)
+        moe_combine(D, slot + t0 * k, w + t0 * k, shared + t0 * width, sg + t0, bo + t0 * width, n, stream, row_sd);
+    else if (f16)
+        moe_combine_peer16(D, slot + t0 * k, w + t0 * k, shared + t0 * width, sg + t0, (const uint16_t*) sums + t0 * width, rows_local,
+                           bo + t0 * width, n, stream);
+    else
+        moe_combine_peer(D, slot + t0 * k, w + t0 * k, shared + t0 * width, sg + t0, (const float*) sums + t0 * width, rows_local,
+                         bo + t0 * width, n, stream);
+}
 /// y = FP16 bits of x, saturated at +-65504 (the peer's sums on their way back; eddoursul/Strata 2acfac4)
 void sums_to_f16(const float* x, uint16_t* y, int64_t n, void* stream);
 /// dst[0, n) = FP32 of the FP16 src[0, n) (n a multiple of 8, 16-byte aligned; src may be mapped host memory)

@@ -508,7 +508,7 @@ GROUPS = (
     ("kv_cache", ("--kv",)),
     ("expert_cache", ("--expert",)),
     ("offloading", ("--gpu", "--layer-split", "--low-ram", "--offload", "--split", "--vram", "--pcie", "--host-core",
-                    "--pool", "--numa", "--unmap", "--cpu-expert", "--tail-skip")),
+                    "--pool", "--numa", "--unmap", "--cpu-expert")),
     ("prefill", ("--prefill",)),
     ("mtp", ("--mtp", "--spec", "--draft", "--batch-mtp")),
     ("calibration", ("--calib",)),

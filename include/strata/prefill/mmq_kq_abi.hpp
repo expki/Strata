@@ -3,6 +3,8 @@
 // meaning changes; the argument block (ggml's mmq_args) is checked by its size.
 #pragma once
 
+#include <cstdlib>
+
 #define STRATA_KQ_ABI_VERSION 1
 
 #if defined(_WIN32)
@@ -19,10 +21,18 @@ typedef int (*strata_kq_run_fn)(int device, int ggml_type, const void* mmq_args,
 
 // the engine's side (src/prefill/mmq_kq_loader.cpp)
 namespace strata::prefill::mmq::kq {
-/// STRATA_MMQ_KQ=1: the K-quant experts' prompt products through MMQ (opt-in: other rounding than the FP16 path).
-bool wanted();
-/// wanted() and the library is open and started on every GPU (the first call opens it and says what happened).
-bool available();
+/// ggml's id of Q6_K, the one K-quant type MMQ takes by itself (moe_mmq.cu checks it against ggml.h).
+constexpr int kQ6K = 14;
+/// Whether this K-quant type's prompt products go through MMQ: STRATA_MMQ_KQ=0 never, =1 all four types, unset Q6_K only.
+inline bool wanted(int ggml_type) {
+    static const char mode = [] {
+        const char* v = std::getenv("STRATA_MMQ_KQ");
+        return v != nullptr && (v[0] == '0' || v[0] == '1') ? v[0] : '-';
+    }();
+    return mode == '1' || (mode == '-' && ggml_type == kQ6K);
+}
+/// wanted(ggml_type) and the library is open and started on every GPU (the first call opens it and says what happened).
+bool available(int ggml_type);
 /// One product on the current GPU: 0 = launched, else an error (-1: no library or not this type).
 int run(int ggml_type, const void* mmq_args, void* stream);
 /// sizeof(mmq_args) on the engine's side (moe_mmq.cu), checked against the library's.

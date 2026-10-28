@@ -1,12 +1,9 @@
-// Strata. The experts-per-word rule of the DeepSeek V4.1 engine (src/dsv41/ds4_experts_rule.hpp): 5 on a card with 16 GiB or less, 6
-// elsewhere, --experts overrides, DS4_TOPK over both.  No GPU needed.
+// Strata. DeepSeek V4.1's load-time rules (src/dsv41/ds4_experts_rule.hpp): the prompt chunk and the RAM copy of the CPU lane. No GPU needed.
 #include "ds4_experts_rule.hpp"
 
 #include <cstdio>
 #include <cstdlib>
 
-using strata::ds4::experts_per_word;
-using strata::ds4::experts_test_override;
 using strata::ds4::copy_all_fits;
 using strata::ds4::attn_slab_rows;
 using strata::ds4::staging_ring_mb;
@@ -23,64 +20,6 @@ static int fails = 0;
 
 int main() {
     const uint64_t GiB = 1ull << 30;
-    // the owner's 12 GB-class cards (RTX 5070 12227 MiB, RTX 3060 12 GB), 16 GiB cards: faster mode by default
-    CHECK_EQ(experts_per_word(-1, 12227ull << 20, 6), 5);
-    CHECK_EQ(experts_per_word(-1, 12 * GiB, 6), 5);
-    CHECK_EQ(experts_per_word(-1, 16 * GiB, 6), 5);
-    CHECK_EQ(experts_per_word(-1, 8 * GiB, 6), 5);
-    // 24 GB and bigger, and several cards: the model's own 6
-    CHECK_EQ(experts_per_word(-1, 16 * GiB + 1, 6), 6);
-    CHECK_EQ(experts_per_word(-1, 24 * GiB, 6), 6);
-    CHECK_EQ(experts_per_word(-1, 4 * 32 * GiB, 6), 6);
-    CHECK_EQ(experts_per_word(-1, 2 * 12 * GiB, 6), 6);   // two 12 GB cards hold 24 GiB in all
-    // a GPU that shares the PC's RAM (Strix Halo, ~91 GiB visible): faster mode whatever the size; discrete cards by size only
-    CHECK_EQ(experts_per_word(-1, 91 * GiB, 6, true), 5);
-    CHECK_EQ(experts_per_word(-1, 24 * GiB, 6, false), 6);   // a discrete 24 GB card
-    CHECK_EQ(experts_per_word(-1, 12 * GiB, 6, false), 5);   // a discrete 12 GB card
-    CHECK_EQ(experts_per_word(6, 91 * GiB, 6, true), 6);     // --experts 6 wins on the unified-memory GPU too
-    // two or more RDNA4 cards that hold at least half of the experts (4 x R9700, 128 GiB in all): faster mode by default (the 5th argument)
-    CHECK_EQ(experts_per_word(-1, 4 * 32 * GiB, 6, false, true), 5);
-    CHECK_EQ(experts_per_word(-1, 3 * 32 * GiB, 6, false, true), 5);
-    CHECK_EQ(experts_per_word(-1, 4 * 32 * GiB, 6, false, false), 6);   // the same cards when they hold under half (or are not RDNA4): the model's 6
-    CHECK_EQ(experts_per_word(6, 4 * 32 * GiB, 6, false, true), 6);     // --experts 6 (the app's / Terminal's "Full quality") wins
-    CHECK_EQ(experts_per_word(4, 4 * 32 * GiB, 6, false, true), 4);     // so does any other --experts N
-    CHECK_EQ(experts_per_word(5, 4 * 32 * GiB, 6, false, false), 5);
-    CHECK_EQ(experts_per_word(-1, 4 * 32 * GiB, 1, false, true), 1);    // a model of one expert a word has nothing to drop
-    CHECK_EQ(experts_test_override(experts_per_word(-1, 4 * 32 * GiB, 6, false, true), 6), 5);
-    CHECK_EQ(experts_per_word(-1, 91 * GiB, 4, true), 4);    // never raised
-    // unknown memory (0): the model's count, never a silent cut
-    CHECK_EQ(experts_per_word(-1, 0, 6), 6);
-    // the flag decides, both ways
-    CHECK_EQ(experts_per_word(6, 12 * GiB, 6), 6);
-    CHECK_EQ(experts_per_word(4, 12 * GiB, 6), 4);
-    CHECK_EQ(experts_per_word(5, 96 * GiB, 6), 5);
-    CHECK_EQ(experts_per_word(9, 12 * GiB, 6), 6);   // never more than the model has
-    CHECK_EQ(experts_per_word(1, 12 * GiB, 6), 1);
-    // a model that routes to 1 (or no) expert: left alone
-    CHECK_EQ(experts_per_word(-1, 12 * GiB, 1), 1);
-    CHECK_EQ(experts_per_word(-1, 12 * GiB, 0), 0);
-    // a model that routes to fewer than 5: the rule never raises it
-    CHECK_EQ(experts_per_word(-1, 12 * GiB, 4), 4);
-    // the test override wins over the rule and the flag
-#if defined(_WIN32)
-    _putenv("DS4_TOPK=4");
-#else
-    setenv("DS4_TOPK", "4", 1);
-#endif
-    CHECK_EQ(experts_test_override(experts_per_word(-1, 96 * GiB, 6), 6), 4);
-    CHECK_EQ(experts_test_override(experts_per_word(6, 12 * GiB, 6), 6), 4);
-#if defined(_WIN32)
-    _putenv("DS4_TOPK=9");
-#else
-    setenv("DS4_TOPK", "9", 1);
-#endif
-    CHECK_EQ(experts_test_override(5, 6), 5);   // out of range: ignored
-#if defined(_WIN32)
-    _putenv("DS4_TOPK=");
-#else
-    unsetenv("DS4_TOPK");
-#endif
-    CHECK_EQ(experts_test_override(5, 6), 5);
     // attention slab rows: attn_slab_rows(env, chunk, base, spare_bytes, bytes_per_row).  bpr of this model ~ 32768 * 10 + 8 * 1024 * 6 = 377 KB.
     {
         const double bpr = 377000.0;
@@ -227,12 +166,6 @@ int main() {
         CHECK_EQ(is_026_token(""), 0);
         CHECK_EQ(is_026_token("027"), 0);
         CHECK_EQ(is_026_token(nullptr), 0);
-        // the 5-experts default: 4 x R9700 goes back to 6; a small card and an integrated GPU were Faster in 0.2.6 already; --experts wins
-        CHECK_EQ(experts_per_word(-1, 4 * 32 * GiB, 6, false, true, true), 6);
-        CHECK_EQ(experts_per_word(-1, 4 * 32 * GiB, 6, false, true, false), 5);
-        CHECK_EQ(experts_per_word(-1, 12 * GiB, 6, false, false, true), 5);
-        CHECK_EQ(experts_per_word(-1, 91 * GiB, 6, true, false, true), 5);
-        CHECK_EQ(experts_per_word(5, 4 * 32 * GiB, 6, false, true, true), 5);
         // the chunk rule: the multi-card tp run loses the 1024; a --tp 1 run keeps it (0.2.6 had it); an explicit --prefill-chunk is not this rule
         CHECK_EQ(prefill_chunk_default(false, 0.86, false, true, true, 32 * GiB, 8192, true, true), 8192);
         CHECK_EQ(prefill_chunk_default(false, 0.86, false, true, true, 32 * GiB, 8192, true, false), 1024);

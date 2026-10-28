@@ -56,7 +56,6 @@ ALLOWED = {
     # spill 8 / 4 at 48 registers (sm_86), 8 / 8 at 80 (sm_120) under __launch_bounds__(256), no local array
     "strata::kernels::native_gu_lds_kernel": {"sm_120": (8, 0), "sm_86": (8, 0)},
     # int32_t my[10]: the lane's selected expert ids (no spill)
-    "strata::kernels::route_resident_k": {"sm_86": (40, 0)},
     # float a[HPT][32] (HPT = 3): the thread's score tile (no spill; sm_120 keeps it in 142 registers)
     "strata::kernels::{anonymous}::attn_chunk_kernel": {"sm_86": (384, 0)},
     # spill 4 / 4 at 64 registers under __launch_bounds__(THREADS = 256); its cc[NC] / kk[NC][8] / pp[NC][16] / acc[G]
@@ -148,7 +147,6 @@ ALLOWED = {
     # float values[16]: the lane's 16 logits for the top-k selection (no spill)
     "strata::kernels::{anonymous}::route_multi": {"sm_86": (64, 0)},
     # float p[16] / s[16]: s[] is cleared at the selected index (no spill)
-    "strata::kernels::{anonymous}::route_prior_k": {"sm_86": (64, 0)},
     # float values[V] (V = 8): the lane's logits for the top-k selection (no spill)
     "strata::kernels::{anonymous}::route_topk": {"sm_86": (32, 0)},
     # const uint8_t* wr[RPW] / float s[RPW][GRP_NC]: per-row pointers and partial sums (no spill)

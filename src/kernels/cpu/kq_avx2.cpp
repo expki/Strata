@@ -1,14 +1,13 @@
-// src/kernels/cpu/kq_avx2.cpp - Unsloth UD-Q4_K_XL's expert rows (Q4_K gate/up, Q5_1 and Q8_0 down) for several
-// tokens at once, BIT-EXACT against ggml-cpu's own dot products.
+// src/kernels/cpu/kq_avx2.cpp: Q4_K/Q6_K gate/up and Q5_1/Q8_0 down rows for several tokens at once, bit-exact against ggml-cpu's dots.
 //
 // ggml-cpu is built for AVX2 here (STRATA_PORTABLE: GGML_AVX2=ON, GGML_AVX512=OFF), so its vec_dot for these formats
-// is the __AVX2__ branch of ggml-cpu/arch/x86/quants.c: ggml_vec_dot_q4_K_q8_K, ggml_vec_dot_q5_1_q8_1,
-// ggml_vec_dot_q8_0_q8_0.  The functions below are those branches with the loop over tokens moved inside the loop
-// over blocks: everything that depends only on the weights (the 4-bit unpacking, the 6-bit scales and mins, the
-// fifth bits, the absolute values of the Q8_0 weights, the fp16 scales) is done once per block, and every token then
-// runs exactly ggml's integer chain and ggml's float operations in ggml's order - so each token's result is ggml's
-// to the bit (native_expert_parity checks it), whatever the number of tokens.  Unlike the i-quant kernels (#152)
-// the group size therefore never changes an answer.
+// is the __AVX2__ branch of ggml-cpu/arch/x86/quants.c: ggml_vec_dot_q4_K_q8_K, ggml_vec_dot_q6_K_q8_K,
+// ggml_vec_dot_q5_1_q8_1, ggml_vec_dot_q8_0_q8_0.  The functions below are those branches with the loop over tokens
+// moved inside the loop over blocks: everything that depends only on the weights (the 4-bit unpacking, the 6-bit
+// scales and mins, the fifth bits, Q6_K's high bits and scales, the absolute values of the Q8_0 weights, the fp16
+// scales) is done once per block, and every token then runs exactly ggml's integer chain and ggml's float operations
+// in ggml's order.  So each token's result is ggml's to the bit (native_expert_parity checks it), whatever the number
+// of tokens.  Unlike the i-quant kernels (#152) the group size therefore never changes an answer.
 //
 // The gain is the weight-side work and the weight bytes, read once per verify window instead of once per token.
 #include "strata/kernels/cpu/kq_avx2.hpp"
@@ -144,6 +143,69 @@ void q4k_dot(const block_q4_K* x, int nb, const void* const* act, int nt, float*
     }
 }
 
+// ---- Q6_K x Q8_K (ggml_vec_dot_q6_K_q8_K, __AVX2__), the 6-bit weights and their scales unpacked once per block
+alignas(16) const uint8_t k_shuffle_q6[128] = {
+     0, 0, 0, 0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1,  2, 2, 2, 2, 2, 2, 2, 2, 3, 3, 3, 3, 3, 3, 3, 3,
+     4, 4, 4, 4, 4, 4, 4, 4, 5, 5, 5, 5, 5, 5, 5, 5,  6, 6, 6, 6, 6, 6, 6, 6, 7, 7, 7, 7, 7, 7, 7, 7,
+     8, 8, 8, 8, 8, 8, 8, 8, 9, 9, 9, 9, 9, 9, 9, 9, 10,10,10,10,10,10,10,10,11,11,11,11,11,11,11,11,
+    12,12,12,12,12,12,12,12,13,13,13,13,13,13,13,13, 14,14,14,14,14,14,14,14,15,15,15,15,15,15,15,15};
+inline __m128i get_scale_shuffle(int i) { return _mm_loadu_si128((const __m128i*) k_shuffle_q6 + i); }
+
+template <int NT>
+void q6k_dot(const block_q6_K* x, int nb, const void* const* act, float* res) {
+    const __m256i m3 = _mm256_set1_epi8(3);
+    const __m256i m15 = _mm256_set1_epi8(15);
+    __m256 acc[NT];
+    for (int t = 0; t < NT; ++t) acc[t] = _mm256_setzero_ps();
+    for (int i = 0; i < nb; ++i) {
+        const float xd = h2f(x[i].d);
+        const uint8_t* q4 = x[i].ql;
+        const uint8_t* qh = x[i].qh;
+        const __m128i scales = _mm_loadu_si128((const __m128i*) x[i].scales);
+        __m256i sumi[NT];
+        for (int t = 0; t < NT; ++t) sumi[t] = _mm256_setzero_si256();
+        for (int j = 0; j < QK_K / 128; ++j) {
+            const __m256i q4bits1 = _mm256_loadu_si256((const __m256i*) q4);
+            q4 += 32;
+            const __m256i q4bits2 = _mm256_loadu_si256((const __m256i*) q4);
+            q4 += 32;
+            const __m256i q4bitsH = _mm256_loadu_si256((const __m256i*) qh);
+            qh += 32;
+            const __m256i q4h_0 = _mm256_slli_epi16(_mm256_and_si256(q4bitsH, m3), 4);
+            const __m256i q4h_1 = _mm256_slli_epi16(_mm256_and_si256(q4bitsH, _mm256_set1_epi8(12)), 2);
+            const __m256i q4h_2 = _mm256_and_si256(q4bitsH, _mm256_set1_epi8(48));
+            const __m256i q4h_3 = _mm256_srli_epi16(_mm256_and_si256(q4bitsH, _mm256_set1_epi8(-64)), 2);
+            const __m256i q4_0 = _mm256_or_si256(_mm256_and_si256(q4bits1, m15), q4h_0);
+            const __m256i q4_1 = _mm256_or_si256(_mm256_and_si256(q4bits2, m15), q4h_1);
+            const __m256i q4_2 = _mm256_or_si256(_mm256_and_si256(_mm256_srli_epi16(q4bits1, 4), m15), q4h_2);
+            const __m256i q4_3 = _mm256_or_si256(_mm256_and_si256(_mm256_srli_epi16(q4bits2, 4), m15), q4h_3);
+            const __m256i sc_0 = _mm256_cvtepi8_epi16(_mm_shuffle_epi8(scales, get_scale_shuffle(4 * j + 0)));
+            const __m256i sc_1 = _mm256_cvtepi8_epi16(_mm_shuffle_epi8(scales, get_scale_shuffle(4 * j + 1)));
+            const __m256i sc_2 = _mm256_cvtepi8_epi16(_mm_shuffle_epi8(scales, get_scale_shuffle(4 * j + 2)));
+            const __m256i sc_3 = _mm256_cvtepi8_epi16(_mm_shuffle_epi8(scales, get_scale_shuffle(4 * j + 3)));
+            for (int t = 0; t < NT; ++t) {
+                const int8_t* q8 = ((const block_q8_K*) act[t] + i)->qs + 128 * j;
+                const __m256i p16_0 = _mm256_madd_epi16(sc_0, _mm256_maddubs_epi16(q4_0, _mm256_loadu_si256((const __m256i*) q8)));
+                const __m256i p16_1 = _mm256_madd_epi16(sc_1, _mm256_maddubs_epi16(q4_1, _mm256_loadu_si256((const __m256i*) (q8 + 32))));
+                const __m256i p16_2 = _mm256_madd_epi16(sc_2, _mm256_maddubs_epi16(q4_2, _mm256_loadu_si256((const __m256i*) (q8 + 64))));
+                const __m256i p16_3 = _mm256_madd_epi16(sc_3, _mm256_maddubs_epi16(q4_3, _mm256_loadu_si256((const __m256i*) (q8 + 96))));
+                sumi[t] = _mm256_add_epi32(sumi[t], _mm256_add_epi32(p16_0, p16_1));
+                sumi[t] = _mm256_add_epi32(sumi[t], _mm256_add_epi32(p16_2, p16_3));
+            }
+        }
+        const __m256i scales_16 = _mm256_cvtepi8_epi16(scales);
+        for (int t = 0; t < NT; ++t) {
+            const block_q8_K* y = (const block_q8_K*) act[t] + i;
+            const float d = y->d * xd;
+            const __m256i q8sums = _mm256_loadu_si256((const __m256i*) y->bsums);
+            const __m256i q8sclsub = _mm256_slli_epi32(_mm256_madd_epi16(q8sums, scales_16), 5);
+            sumi[t] = _mm256_sub_epi32(sumi[t], q8sclsub);
+            acc[t] = _mm256_fmadd_ps(_mm256_broadcast_ss(&d), _mm256_cvtepi32_ps(sumi[t]), acc[t]);
+        }
+    }
+    for (int t = 0; t < NT; ++t) res[t] = hsum_float_8(acc[t]);
+}
+
 // ---- Q5_1 x Q8_1 (ggml_vec_dot_q5_1_q8_1, __AVX2__)
 template <int NT>
 void q5_1_dot(const block_q5_1* x, int nb, const void* const* act, float* res) {
@@ -214,9 +276,22 @@ void q8_0_dot_nt(const block_q8_0* x, int nb, const void* const* act, int nt, fl
     }
 }
 
+void q6k_dot_nt(const block_q6_K* x, int nb, const void* const* act, int nt, float* res) {
+    for (int t0 = 0; t0 < nt; t0 += 4) {
+        const int k = nt - t0 < 4 ? nt - t0 : 4;
+        switch (k) {
+            case 1: q6k_dot<1>(x, nb, act + t0, res + t0); break;
+            case 2: q6k_dot<2>(x, nb, act + t0, res + t0); break;
+            case 3: q6k_dot<3>(x, nb, act + t0, res + t0); break;
+            default: q6k_dot<4>(x, nb, act + t0, res + t0); break;
+        }
+    }
+}
+
 void dot_rows(int type, const uint8_t* row, int n, const void* const* act, int nt, float* res) {
     switch (type) {
         case 12: q4k_dot((const block_q4_K*) row, n / QK_K, act, nt, res); break;
+        case 14: q6k_dot_nt((const block_q6_K*) row, n / QK_K, act, nt, res); break;
         case 7: q5_1_dot_nt((const block_q5_1*) row, n / QK5_1, act, nt, res); break;
         case 8: q8_0_dot_nt((const block_q8_0*) row, n / QK8_0, act, nt, res); break;
         default: break;

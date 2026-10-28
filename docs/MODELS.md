@@ -73,7 +73,7 @@ you have the disk. Perplexity is measured on a fixed set of 4,995 test texts; lo
 | AMD Ryzen AI Max (Strix Halo, gfx1151, 128 GB unified; 64 GB or more shared with Windows) | Windows |
 
 Tested on an RTX 3060 (Linux), an RTX 5070 (Windows), four R9700 cards (Linux) and a Ryzen AI Max+ 395 with 128 GB unified (Windows:
-14 to 16 tokens a second on code with the default Faster mode, 10 to 11 on chat, 78 tokens a second on a 4K prompt and 109 on
+14 to 16 tokens a second on code with upstream's Faster mode (5 of 6 experts, removed here, so expect less), 10 to 11 on chat, 78 tokens a second on a 4K prompt and 109 on
 8K). The RTX 30 kernels were also checked on an RTX A4000. Windows on RTX 30 and the RX 9070 are built but were not run. Mac
 and Strix Halo on Linux do not run it yet; on Strix Halo Windows the graphics memory is the RAM, so most of the experts are
 read from the SSD and an NVMe drive matters.
@@ -90,9 +90,8 @@ strata launch --family deepseek41 --model ist-das-2.00bpw
 
 `--model-path DIR` starts from files you already have. The context is 8192 tokens (8K), the size it was checked at.
 
-**Speed: Faster or Full quality.** The app asks, and the Terminal takes `--speed faster|full` (or `--full-quality`). Faster uses 5 of the
-model's 6 experts per word, a small quality change that is usually not noticeable. It is the default on a PC with 16 GB of graphics
-memory or less. Full quality uses all 6. It needs DeepSeek engine 0.1.50 or newer, which the app and `strata launch` fetch.
+**Every word takes all 6 of its experts.** The Faster mode that used 5 of them is removed. The Terminal still accepts
+`--speed` and `--full-quality` from older scripts, says they are not used, and starts.
 
 **Measured on:** IST-DAS 2.00 bpw, Strata 0.2.4 (before the Speed choice).
 

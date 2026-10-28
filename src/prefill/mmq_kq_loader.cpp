@@ -64,7 +64,7 @@ Lib open_lib() {
     void* h = dlopen(path.c_str(), RTLD_NOW | RTLD_LOCAL);
 #endif
     if (h == nullptr) {
-        std::fprintf(stderr, "strata: K-quant prompt kernels (STRATA_MMQ_KQ=1): %s not found next to the engine - "
+        std::fprintf(stderr, "strata: K-quant prompt kernels: %s not found next to the engine - "
                              "these experts take the FP16 prompt path\n", STRATA_KQ_LIB_NAME);
         return L;
     }
@@ -93,7 +93,7 @@ Lib open_lib() {
         }
     }
     cudaSetDevice(cur);
-    std::fprintf(stderr, "strata: K-quant prompt kernels from %s (STRATA_MMQ_KQ=1)\n", path.c_str());
+    std::fprintf(stderr, "strata: K-quant prompt kernels from %s\n", path.c_str());
     L.ok = true;
     return L;
 }
@@ -105,15 +105,7 @@ const Lib& lib() {
 
 }  // namespace
 
-bool wanted() {
-    static const bool on = [] {
-        const char* v = std::getenv("STRATA_MMQ_KQ");
-        return v != nullptr && v[0] == '1';
-    }();
-    return on;
-}
-
-bool available() { return wanted() && lib().ok; }
+bool available(int ggml_type) { return wanted(ggml_type) && lib().ok; }
 
 int run(int type, const void* args, void* stream) {
     int dev = 0;

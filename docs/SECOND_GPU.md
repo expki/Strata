@@ -75,8 +75,8 @@ NVLink or another peer-to-peer path. It is an alternative to the helper caches a
 
 | Flag | Default | Meaning |
 | --- | --- | --- |
-| `--peer-device N` | off | Enable the tier on CUDA device N (N >= 1). |
-| `--peer-reserve-mib M` | 600 | VRAM left free on the peer card. Keep a few hundred MiB free on both cards beyond this, because the prompt path loads its kernels and cuBLAS on first use. |
+| `--peer-device N` | off | Enable the tier on CUDA device N (N >= 1). `hip:N` puts it on an AMD card instead: [NVIDIA and AMD together](MULTI_GPU.md#nvidia-and-amd-together-experimental). |
+| `--peer-reserve-mib M` | 600 (320 on an AMD card) | VRAM left free on the peer card. Keep a few hundred MiB free on both cards beyond this, because the prompt path loads its kernels and cuBLAS on first use. |
 | `--peer-slots N` | 0 | Cap the tier at N experts; 0 means as many as fit. |
 | `--peer-adapt-swaps N` | -1 | Swaps per adaptive round on the peer; -1 uses the primary's `--adapt-swaps`. |
 | `--peer-prefill-rows N` | -1 | Share of each prompt chunk's rows the peer computes; -1 is half of chunk x top-k, 0 keeps prompt rows on the primary. |
@@ -88,10 +88,10 @@ for that route by hand.
 Through the server, list both cards in the config's `"gpu"` (for example `[0, 1]`, numbered as `nvidia-smi` numbers them) and add
 `--peer-device 1` to `"args"`. The number is the card's position in that list (with `"gpu": [2, 0]`, `--peer-device 1` is
 `nvidia-smi`'s card 0). Several GPUs in `"gpu"` are otherwise a layer split; the server adds `--layer-split` only when
-`--peer-device` is not among the args.
+`--peer-device` is not among the args, or names an AMD card (`hip:N`).
 
 `--peer-device` requires `--expert-profile` and an enabled expert cache, and the device must be visible. It refuses
-`--layer-split` and `--expert-cache-device1..3`:
+`--layer-split` (an AMD card, `hip:N`, may sit beside one) and `--expert-cache-device1..3`:
 
 ```text
 strata generate: --peer-device cannot be combined with --layer-split (use one or the other)

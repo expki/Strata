@@ -1,4 +1,8 @@
-# KVA: a faster prompt read for long cold prompts (opt-in, off by default)
+# KVA: a faster prompt read for long cold prompts (removed in this fork)
+
+**This fork removed KVA.** It skips the MoE half of the late layers, so some experts are never run. The engine reads every
+prompt exactly. `STRATA_KVA` only prints a line that says it was removed, and the app and the Terminal have no
+"Faster long prompts" switch. The text below is upstream's, kept as history.
 
 KVA ("approximate late-layer state") reads a long prompt exactly through the early layers, then for the late layers
 builds **only their recurrent state** — the GDN recurrence and convolution history, the QSA K/V pages and the

@@ -268,7 +268,7 @@ Two things to know when measuring on such a card:
 - **Temperature.** A P40 has no fan of its own. At 89 C the driver reports `SW Thermal Slowdown: Active` and the clock falls from
   1,531 to about 1,300 MHz (`nvidia-smi -q -d PERFORMANCE`). Start every arm of an A/B at the same temperature, or the later arm loses.
 - **Greedy answers are not identical run to run on a CPU without AVX-512**, even with `--prompt-cache 0 --adapt-swaps 0
-  --pcie-frac 0`. Add `STRATA_IQ_MT_MIN=1` (and `STRATA_PREFILL_CPU_SHARE=0`, `STRATA_ROUTE_TAIL_SKIP=0`) to compare two builds'
+  --pcie-frac 0`. Add `STRATA_IQ_MT_MIN=1` (and `STRATA_PREFILL_CPU_SHARE=0`) to compare two builds'
   answers byte for byte.
 
 Profiling switches: `STRATA_PREFILL_TIMING=1`, `STRATA_DECODE_TIMING=1`, `STRATA_VERIFY_PROFILE=1`.

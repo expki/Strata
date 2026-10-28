@@ -7,7 +7,6 @@
 #include "strata/core/emulate.hpp"
 #define STRATA_Q81_FASTMATH_DIV 1   // #3948: the q8_1 stores divide as native_mmvq.cu (--use_fast_math) does, see q8_1_finite.hpp
 #include "strata/kernels/q8_1_finite.hpp"   // #606: q8_1_ds
-#include "strata/kernels/window_start.hpp"  // KVA: the draft layer's window floor
 #include "strata/kernels/dp4a.hpp"
 #include "strata/kernels/pdl.hpp"
 
@@ -1018,30 +1017,6 @@ void window_ids(int32_t* steps, int n, int window, int32_t* ids, int64_t ids_str
     check("window_ids");
 }
 
-namespace {
-// window_ids with a floor read from (mapped) memory when the kernel RUNS: the captured graph keeps the pointer, the
-// value changes between sessions.  A floor of 0 gives window_ids' selection exactly (strata::kernels::window_start).
-__global__ void window_ids_floor_kernel(int32_t* steps, int window, int32_t* ids, long long stride,
-                                        const volatile int32_t* floor_cell) {
-    const int q = blockIdx.y;
-    int32_t* st = steps + q * 4;
-    const int n_kv = st[1];
-    const int start = strata::kernels::window_start(n_kv, window, *floor_cell);
-    const int width = n_kv - start;
-    for (int j = blockIdx.x * blockDim.x + threadIdx.x; j < width; j += gridDim.x * blockDim.x)
-        ids[q * stride + j] = start + j;
-    __syncthreads();
-    if (blockIdx.x == 0 && threadIdx.x == 0) st[3] = width;
-}
-}  // namespace
-
-void window_ids_floor(int32_t* steps, int n, int window, int32_t* ids, int64_t ids_stride, const int32_t* floor_cell,
-                      void* stream) {
-    window_ids_floor_kernel<<<dim3(8, (unsigned) n), 256, 0, (cudaStream_t) stream>>>(steps, window, ids, (long long) ids_stride,
-                                                                                    floor_cell);
-    check("window_ids_floor");
-}
-
 void dense_steps(const int32_t* cells, int n, int32_t* steps, void* stream) {
     dense_steps_kernel<<<1, 64, 0, (cudaStream_t) stream>>>(cells, n, steps);
     check("dense_steps");
@@ -1236,10 +1211,14 @@ __device__ __forceinline__ unsigned long long strata_now_ns() {
 // the overlapped split's hand-off wait, bounded: spin until *flag >= value, or give up after timeout_ns (0: never),
 // marking *err = 1 (mapped) so the host fails the window instead of using a stale hand-off.  The window's later
 // kernels still run (on whatever the hand-off buffer holds) so the graph completes and no stream is left hanging.
+template <bool kStopOnErr>   // also return once *err is set, so a wait queued behind one that timed out ends at once
 __global__ void wait_handoff_kernel(const volatile uint32_t* flag, uint32_t value, uint32_t* err,
                                     unsigned long long timeout_ns) {
     const unsigned long long t0 = timeout_ns ? strata_now_ns() : 0ull;
     while (*flag < value) {
+        if constexpr (kStopOnErr) {
+            if (*(const volatile uint32_t*) err != 0u) break;
+        }
         strata_spin_pause();
         if (timeout_ns && strata_now_ns() - t0 > timeout_ns) {
             *(volatile uint32_t*) err = 1u;
@@ -1247,6 +1226,13 @@ __global__ void wait_handoff_kernel(const volatile uint32_t* flag, uint32_t valu
             return;
         }
     }
+    __threadfence_system();
+}
+
+// a fence so the stream's earlier writes land first, the store, and a fence so the store leaves the card at once
+__global__ void raise_flag_kernel(uint32_t* flag, uint32_t value) {
+    __threadfence_system();
+    *(volatile uint32_t*) flag = value;
     __threadfence_system();
 }
 
@@ -1283,8 +1269,18 @@ __global__ void wait_flag_ge_stamped_kernel(const volatile uint32_t* flag, uint3
 }  // namespace
 
 void wait_handoff(const uint32_t* flag, uint32_t value, uint32_t* err, unsigned long long timeout_ns, void* stream) {
-    wait_handoff_kernel<<<1, 1, 0, (cudaStream_t) stream>>>(flag, value, err, timeout_ns);
+    wait_handoff_kernel<false><<<1, 1, 0, (cudaStream_t) stream>>>(flag, value, err, timeout_ns);
     check("wait_handoff");
+}
+
+void wait_handoff_or_err(const uint32_t* flag, uint32_t value, uint32_t* err, unsigned long long timeout_ns, void* stream) {
+    wait_handoff_kernel<true><<<1, 1, 0, (cudaStream_t) stream>>>(flag, value, err, timeout_ns);
+    check("wait_handoff_or_err");
+}
+
+void raise_flag(uint32_t* flag, uint32_t value, void* stream) {
+    raise_flag_kernel<<<1, 1, 0, (cudaStream_t) stream>>>(flag, value);
+    check("raise_flag");
 }
 
 void handoff_publish(float* dst, const float* a, int64_t na, const float* b, int64_t nb, const float* c, int64_t nc,

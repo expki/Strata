@@ -21,8 +21,7 @@ Model availability, provider preference and API details are in [AI_REFERENCE.md]
   DeepSeekV4.1-Flash-1017 (`--family deepseek41`) runs in the app and in the Terminal, on NVIDIA RTX 30, 40 and 50
   (Windows and Linux) and on the AMD Radeon AI PRO R9700 under Linux. It has three sets: 1.75 bpw (239 GB of disk),
   2.00 bpw (257 GB) and 2.25 bpw (274 GB), and for a 12 GB card it needs 46 to 64 GB of RAM. The context is 8K.
-  `--speed faster|full` (or `--full-quality`) chooses how many experts it uses per word; Faster is the default on a
-  PC with 16 GB of graphics memory or less. Print the plan first:
+  Every word takes all 6 of its experts (the Faster mode is removed). Print the plan first:
   `strata launch --plan --family deepseek41 --model ist-das-2.00bpw`.
 - Check the **chosen pack's** memory and disk needs. Do not reuse a Flash-Next estimate for every family.
   Unified memory is one pool, not RAM plus VRAM. A completed download does not establish that a model can run.

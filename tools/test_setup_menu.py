@@ -155,10 +155,10 @@ class UnslothDefaultEnv(unittest.TestCase):
             self.assertNotIn("STRATA_HC_Q8", f("unsloth", m, True, True), m)          # not on AMD
         self.assertNotIn("STRATA_HC_Q8", f("unsloth", "Q8_0", False, True))
 
-    def test_tail_skip_off_only_when_every_expert_is_in_ram(self):
+    def test_no_tail_skip_switch_is_written(self):
         f = setup.unsloth_default_env
-        self.assertEqual(f("unsloth", "UD-Q4_K_XL", False, False)["STRATA_ROUTE_TAIL_SKIP"], "0")
-        self.assertNotIn("STRATA_ROUTE_TAIL_SKIP", f("unsloth", "UD-Q4_K_XL", False, True))   # budget mode keeps the skip
+        for in_budget in (False, True):   # the engine removed the route tail skip
+            self.assertNotIn("STRATA_ROUTE_TAIL_SKIP", f("unsloth", "UD-Q4_K_XL", False, in_budget))
 
     def test_other_families_are_untouched(self):
         for fam, m in (("qwen", "IQ3_S"), ("swift", "Q2_0"), ("coder", "IQ1_M"), ("nvfp4", "NVFP4")):

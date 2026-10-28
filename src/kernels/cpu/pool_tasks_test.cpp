@@ -44,8 +44,33 @@ static void unset_env(const char* k) {
 #endif
 }
 
+// a one-batch layer's tasks: every row once, and with even shares no task holds more than one row over another
+static bool native_tasks_ok() {
+    for (bool even : {true, false})
+        for (int T : {1, 7, 16, 32})
+            for (int nb = 1; nb <= 12; ++nb)
+                for (int per : {640, 2560}) {
+                    if (!even && T < nb) continue;   // the interleaved parts need a task per expert
+                    std::vector<int> hits((size_t) nb * per, 0);
+                    int64_t lo = INT64_MAX, hi = 0;
+                    for (int j = 0; j < T; ++j) {
+                        const cpu::ExpertPool::NativeTask t = cpu::ExpertPool::native_task(j, T, nb, per, even);
+                        for (int64_t k = 0; k < t.rows; ++k) ++hits[(size_t) ((int64_t) t.e * per + t.r0 + k)];
+                        lo = std::min(lo, t.rows);
+                        hi = std::max(hi, t.rows);
+                    }
+                    for (int h : hits) if (h != 1) { std::fprintf(stderr, "rows not covered once: T=%d nb=%d even=%d\n", T, nb, even); return false; }
+                    if (even && hi - lo > 1) {
+                        std::fprintf(stderr, "uneven tasks: T=%d nb=%d per=%d, %lld to %lld rows\n", T, nb, per, (long long) lo, (long long) hi);
+                        return false;
+                    }
+                }
+    return true;
+}
+
 int main(int argc, char** argv) {
     if (argc != 1 && argc != 4) return 2;
+    if (!native_tasks_ok()) return 1;
     // its activation quantiser is the AVX one at least (act_quant_any): a CPU without AVX (Westmere) would stop on an illegal instruction
     if (!cpu::cpu_avx1_ok()) { std::printf("pool_tasks_test: no AVX on this CPU, skipped\n"); return 0; }
     cpu::NativeFmt f;
@@ -100,6 +125,63 @@ int main(int argc, char** argv) {
         }
         const auto ref = out;
         for (float v : ref) if (!std::isfinite(v)) return 1;
+        {   // the pool is the kernels' own arithmetic: each expert's tokens through gate/up, the quantized h, then down
+            std::vector<float> ffb((size_t) cpu::MAXT * cpu::FF), serial((size_t) cpu::MAXT * cpu::H);
+            std::vector<std::vector<uint8_t>> hq(cpu::MAXT, std::vector<uint8_t>(cpu::kNativeHBytes));
+            for (int e = 0; e < n; ++e) {
+                float* ffp[cpu::MAXT];
+                float* op[cpu::MAXT];
+                const void* hp[cpu::MAXT];
+                for (int t = 0; t < jobs[e].nt; ++t) {
+                    ffp[t] = ffb.data() + (size_t) t * cpu::FF;
+                    op[t] = serial.data() + (size_t) t * cpu::H;
+                    hp[t] = hq[(size_t) t].data();
+                }
+                cpu::native_gu_rows(f, jobs[e].blob, jobs[e].nact, jobs[e].nt, ffp, 0, (int) f.n_ff);
+                for (int t = 0; t < jobs[e].nt; ++t) cpu::native_quant_h(f, ffp[t], hq[(size_t) t].data());
+                cpu::native_down_rows(f, jobs[e].blob, hp, jobs[e].nt, op, 0, (int) f.n_embd);
+                for (int t = 0; t < jobs[e].nt; ++t)
+                    if (!same_h(op[t], jobs[e].out[t])) {
+                        std::fprintf(stderr, "the pool differs from the kernels run serially: n=%d expert %d token %d\n", n, e, t);
+                        return 1;
+                    }
+            }
+        }
+        {   // a native layer is one batch: its down rows wait for their own expert's gate/up rows, not for every expert's
+            cpu::ExpertPool pool(3, false);
+            const uint32_t b0 = pool.batches();
+            pool.run_split_multi_native(f, jobs.data(), n);
+            const uint32_t want = (uint32_t) ((n + cpu::ExpertPool::kMaxSplitMulti - 1) / cpu::ExpertPool::kMaxSplitMulti);
+            if (pool.batches() - b0 != want) {
+                std::fprintf(stderr, "n=%d experts took %u batches, not %u\n", n, pool.batches() - b0, want);
+                return 1;
+            }
+        }
+        for (int workers : {1, 3, 15}) {   // STRATA_POOL_EVEN=0: the interleaved parts, the same bits
+            put_env("STRATA_POOL_EVEN", "0");
+            cpu::ExpertPool pool(workers, false);
+            unset_env("STRATA_POOL_EVEN");
+            for (const auto& job : jobs) for (int t = 0; t < job.nt; ++t) nan_h(job.out[t]);
+            pool.run_split_multi_native(f, jobs.data(), n);
+            if (std::memcmp(ref.data(), out.data(), out.size() * sizeof(float)) != 0) {
+                std::fprintf(stderr, "STRATA_POOL_EVEN=0: n=%d workers=%d changed the output\n", n, workers);
+                return 1;
+            }
+        }
+        {   // STRATA_POOL_ONE_BATCH=0: two phases a layer again, the same bits
+            put_env("STRATA_POOL_ONE_BATCH", "0");
+            cpu::ExpertPool pool(3, false);
+            unset_env("STRATA_POOL_ONE_BATCH");
+            for (const auto& job : jobs) for (int t = 0; t < job.nt; ++t) nan_h(job.out[t]);
+            const uint32_t b0 = pool.batches();
+            pool.run_split_multi_native(f, jobs.data(), n);
+            const uint32_t want = (uint32_t) (2 * ((n + cpu::ExpertPool::kMaxSplitMulti - 1) / cpu::ExpertPool::kMaxSplitMulti));
+            if (pool.batches() - b0 != want || std::memcmp(ref.data(), out.data(), out.size() * sizeof(float)) != 0) {
+                std::fprintf(stderr, "STRATA_POOL_ONE_BATCH=0: n=%d took %u batches (not %u) or changed the output\n", n,
+                             pool.batches() - b0, want);
+                return 1;
+            }
+        }
         for (bool host : {false, true}) for (int workers : {1, 3})
             for (int tasks : {0, 1, 41, 128, 192, 256, cpu::ExpertPool::kMaxTasks}) {
                 cpu::ExpertPool pool(workers, false, host, cpu::PoolAffinity::All, tasks);

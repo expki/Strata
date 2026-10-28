@@ -1,4 +1,5 @@
 // The prompt planner's host-memory model (#2824): no GPU, no model.
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <vector>
@@ -123,6 +124,11 @@ int main() {
         CHECK(c <= 3840);
         CHECK(n <= (t + 3839) / 3840 + 1);
     }
+    // the AMD card's link counts in full only while its cap of a layer's RAM experts does not hold it back
+    CHECK(tier_link_gbps(12.0, 25.7, 64, 64) == 25.7);                     // it could take every RAM expert
+    CHECK(tier_link_gbps(12.0, 12.0, 128, 64) == 12.0);                    // equal links, half each: the cap is just enough
+    CHECK(std::fabs(tier_link_gbps(12.0, 25.7, 192, 64) - 6.0) < 1e-9);    // a third of them: 64 while the stage copies 128
+    CHECK(tier_link_gbps(12.0, 25.7, 192, 0) == 0.0 && tier_link_gbps(12.0, -1.0, 192, 64) == 0.0 && tier_link_gbps(0.0, 25.7, 192, 64) == 0.0);
     std::printf("%s\n", failed ? "FAILED" : "prefill_plan_test: ok");
     return failed ? 1 : 0;
 }

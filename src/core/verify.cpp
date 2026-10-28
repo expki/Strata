@@ -36,7 +36,6 @@
 #include "strata/kernels/elementwise.hpp"
 #include "strata/kernels/qsa_prompt_attn.hpp"
 #include "strata/kernels/fused_gr.hpp"
-#include "strata/kernels/route_prior.hpp"
 #include "strata/kernels/cvec.hpp"
 #include "strata/kernels/gr.hpp"
 #include "strata/kernels/kv_q4.hpp"
@@ -102,68 +101,6 @@ using Clock = std::chrono::steady_clock;
 double ms_since(Clock::time_point t) { return std::chrono::duration<double, std::milli>(Clock::now() - t).count(); }
 const bool g_dbg = std::getenv("STRATA_VERIFY_DEBUG") != nullptr;
 inline bool g_lfuse() { static const bool on = [] { const char* v = std::getenv("STRATA_LFUSE"); return v != nullptr && v[0] == '1'; }(); return on; }
-// STRATA_ROUTE_RESIDENT=<margin logits> (+ STRATA_ROUTE_RESIDENT_RANKS=lo-hi, default 6-9): residency-biased routing.
-struct RouteResidentCfg;
-RouteResidentCfg& route_resident_cfg();
-struct RouteResidentCfg {
-    float margin = 0.0f;
-    int lo = 6, hi = 9;
-    // #1578: one counter block per GPU.  A layer split inits a verifier per stage; a block allocated on whichever device
-    // was current at the first init is unreachable from the other stage's kernels without P2P (illegal memory access).
-    // The Verifier asks for its device's block in init (outside graph capture) and keeps the pointer: a launch never
-    // picks the block by the host thread's current device.  nullptr (the allocation failed): the kernel runs without counters.
-    std::mutex mu;
-    std::map<int, unsigned long long*> blocks;
-    unsigned long long* stats_on(int dev) {
-        if (margin <= 0.0f || dev < 0) return nullptr;
-        std::lock_guard<std::mutex> lk(mu);
-        const auto it = blocks.find(dev);
-        if (it != blocks.end()) return it->second;
-        unsigned long long* p = nullptr;
-        {
-            const OnDevice on(dev);
-            if (cudaMalloc((void**) &p, 8 * sizeof(unsigned long long)) != cudaSuccess ||
-                cudaMemset(p, 0, 8 * sizeof(unsigned long long)) != cudaSuccess) {
-                (void) cudaGetLastError();
-                if (p != nullptr) cudaFree(p);
-                p = nullptr;
-                std::fprintf(stderr, "route-resident: the counters could not be allocated on GPU %d; it runs without them\n", dev);
-            }
-        }
-        if (blocks.empty()) {
-            std::atexit([] {
-                RouteResidentCfg& c = route_resident_cfg();
-                for (const auto& kv : c.blocks) {
-                    if (kv.second == nullptr) continue;
-                    unsigned long long h[8] = {};
-                    if (cudaSetDevice(kv.first) != cudaSuccess || cudaDeviceSynchronize() != cudaSuccess ||
-                        cudaMemcpy(h, kv.second, sizeof(h), cudaMemcpyDeviceToHost) != cudaSuccess) {
-                        (void) cudaGetLastError();
-                        continue;
-                    }
-                    char who[32] = "";
-                    if (c.blocks.size() > 1) std::snprintf(who, sizeof who, " (GPU %d)", kv.first);
-                    std::fprintf(stderr, "route-resident%s: margin=%g ranks=%d-%d windows T>8 (prompt reads): tail_nonres=%llu swaps=%llu (%.1f%%) nonres_entries before=%llu after=%llu\n",
-                                 who, c.margin, c.lo, c.hi, h[0], h[1], h[0] ? 100.0 * h[1] / h[0] : 0.0, h[2], h[3]);
-                    std::fprintf(stderr, "route-resident%s: margin=%g ranks=%d-%d windows T<=8 (decode): tail_nonres=%llu swaps=%llu (%.1f%%) nonres_entries before=%llu after=%llu\n",
-                                 who, c.margin, c.lo, c.hi, h[4], h[5], h[4] ? 100.0 * h[5] / h[4] : 0.0, h[6], h[7]);
-                }
-            });
-        }
-        blocks[dev] = p;
-        return p;
-    }
-};
-RouteResidentCfg& route_resident_cfg() {
-    static RouteResidentCfg c;
-    static const bool parsed = [] {
-        if (const char* v = std::getenv("STRATA_ROUTE_RESIDENT")) c.margin = (float) std::atof(v);
-        if (const char* v = std::getenv("STRATA_ROUTE_RESIDENT_RANKS")) std::sscanf(v, "%d-%d", &c.lo, &c.hi);
-        return true;
-    }();
-    (void) parsed;
-    return c;
-}
 inline bool g_lfuse_gate() { static const bool on = [] { const char* v = std::getenv("STRATA_LFUSE_GATE"); return v == nullptr || v[0] != '0'; }(); return on; }
 inline bool g_lfuse_pair() { static const bool on = [] { const char* v = std::getenv("STRATA_LFUSE_PAIR"); return v == nullptr || v[0] != '0'; }(); return on; }
 inline bool g_qdedup() { static const bool on = [] { const char* v = std::getenv("STRATA_VERIFY_QDEDUP"); return v != nullptr && std::atoi(v) != 0; }(); return on; }
@@ -265,34 +202,6 @@ inline int g_side_mixer() {
         per_dev[dev] = 1 + (ok && strata::sm120_default(maj, mnr) ? 2 : 0);
     }
     return per_dev[dev] - 1;
-#endif
-}
-// STRATA_ROUTE_PRIOR=lambda: residency-biased routing (the top-10 picked again with a logit bonus for the resident
-// experts; route_prior.cu).  Unset: 1.5 (strata::kRoutePriorSmallCard, sm120_series.hpp; it was 2.0 until the owner decision of
-// 2026-10-26: defects in the copy and code check at 2.0, none in 19 tasks at 1.5) on a DISCRETE NVIDIA card of 13 GiB or less
-// (CUDA builds only), 0 elsewhere.
-// Measured on an RTX 3060 12 GB only (IQ3_XXS, 5 interleaved pairs at 2.0: +37.6% / +35.2% decode; at 1.5 story +15%, code +37%); the owner approved the
-// quality trade for 12 GB cards (it changes which experts run).  Not a default in a HIP build (a 12 GB Radeon, or a
-// Strix Halo whose reported VRAM is a small carve-out of unified memory: unmeasured there) and not on an integrated GPU.
-// STRATA_ROUTE_PRIOR=0 turns it off, any other value wins everywhere.  The default is read from the device properties
-// (no allocation, no stream work), and Verifier::init asks once per card, so the first ask is never inside a graph capture.
-inline float g_route_prior() {
-    static const char* const env_s = std::getenv("STRATA_ROUTE_PRIOR");
-    static const float env = env_s ? (float) std::atof(env_s) : 0.0f;
-    if (env_s != nullptr) return env;
-#if defined(STRATA_USE_HIP) || defined(STRATA_GPU_METAL)
-    return 0.0f;
-#else
-    static float per_dev[64];   // 0 unknown, else prior + 1
-    int dev = 0;
-    if (cudaGetDevice(&dev) != cudaSuccess || dev < 0 || dev >= 64) { cudaGetLastError(); return 0.0f; }
-    if (per_dev[dev] == 0.0f) {
-        cudaDeviceProp p;
-        const bool ok = cudaGetDeviceProperties(&p, dev) == cudaSuccess;
-        if (!ok) cudaGetLastError();
-        per_dev[dev] = 1.0f + (ok ? strata::route_prior_default(false, p.integrated != 0, (double) p.totalGlobalMem, strata::qwen_defaults_026()) : 0.0f);
-    }
-    return per_dev[dev] - 1.0f;
 #endif
 }
 inline bool g_qfuse() { static const bool on = [] { const char* v = std::getenv("STRATA_QFUSE"); return v != nullptr && std::atoi(v) != 0; }(); return on; }
@@ -802,13 +711,6 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
     }
     release_gpu_fn().store(&release_live_verifiers);
     cudaGetDevice(&device_);   // a layer split's stage on another GPU: its streams, graphs and buffers live there
-    rr_stats_ = route_resident_cfg().stats_on(device_);   // STRATA_ROUTE_RESIDENT: this GPU's counters, outside graph capture
-    {   // once per card, here: record_window (graph capture) only reads the cached value
-        const float rp = g_route_prior();
-        if (rp > 0.0f && std::getenv("STRATA_ROUTE_PRIOR") == nullptr)
-            std::fprintf(stderr, "strata verify: residency-biased routing is on by default on this card (STRATA_ROUTE_PRIOR=%.1f: a card of 13 GiB "
-                                 "or less; it changes which experts run; STRATA_ROUTE_PRIOR=0 turns it off)\n", (double) rp);
-    }
     strata::kernels::fused_gr_check();   // once per card: which bitwise-equal hyper-connection read runs there
     strata::kernels::fused_gr_persist_init();   // opt-in STRATA_HC_PERSIST=1 (HIP)
     wt_ = &wt;
@@ -888,6 +790,7 @@ bool Verifier::init(const WeightTable& wt, const ModelGeometry& g, SessionState&
               mapped(64, (void**) &h_plan_err_, (void**) &m_plan_err_) &&
               mapped(T * K * N * 4, (void**) &h_ymiss_, (void**) &m_ymiss_);
     if (!ok) { err = "verify: mapped staging allocation failed " + strata::core::pin_exhausted_hint(); return false; }
+    ymiss_bytes_ = T * K * N * 4;
     // DFlash2 taps: set_taps (the drafter) or STRATA_TAP_FILE (the research dump); off, and nothing is allocated or captured, otherwise
     const char* tap_path = std::getenv("STRATA_TAP_FILE");
     if (tap_path != nullptr && tap_path[0] == '\0') tap_path = nullptr;
@@ -2105,21 +2008,6 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
             MoEBuffers mb = ss.moe;
             mb.logits = logits_ + t * NE; mb.ids = ids_ + t * K; mb.weights = w_ + t * K;
             if (!moe_route(wt, g, l, K, mb, mixed_ + t * N, cs, err, nullptr)) return false;
-        }
-        // STRATA_ROUTE_PRIOR=lambda (changes the output): the top-10 picked again with a logit bonus for the resident
-        // experts; the weights stay the router's (route_prior.cu).  The default is g_route_prior() above: 1.5 on a
-        // discrete CUDA card of 13 GiB or less, off elsewhere (measured on an RTX 3060 12 GB at 2.0: story +37.6%, code +35.2%;
-        // on an RTX PRO 5000 72 GB -1.9% / -0.5%, on 2x RTX A4000 -4.2% / +11.0%, hence not a default on bigger cards).
-        const float route_prior = g_route_prior();
-        if (route_prior > 0.0f && NE == 512 && K == 10 && hits_.d_res != nullptr)
-            route_prior_top10(logits_ + tb * NE, hits_.d_res + l * g.n_expert, route_prior, ids_ + tb * K, w_ + tb * K, n, cs);
-        if (route_resident_cfg().margin > 0.0f && NE == 512 && K == 10 && hits_.d_res != nullptr) {
-            // STRATA_ROUTE_RESIDENT: after the router, before the plan/doorbell read ids_/w_ (opt-in, changes the output)
-            try {
-                native_route_resident(logits_ + tb * NE, ids_ + tb * K, w_ + tb * K, hits_.d_res + l * g.n_expert, n,
-                                      route_resident_cfg().margin, route_resident_cfg().lo, route_resident_cfg().hi,
-                                      rr_stats_ != nullptr ? rr_stats_ + (n <= 8 ? 4 : 0) : nullptr, cs);
-            } catch (const std::exception& e) { err = "verify route-resident: " + std::string(e.what()); return false; }
         }
         if (rs_on_ && G == 1 && n <= 8 && T <= 8)
             strata::kernels::route_marginal_stats(ids_ + tb * K, n, (int) K, rs_dev_ + ((size_t) T * (size_t) g.n_layers + (size_t) l) * 8, cs);

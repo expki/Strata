@@ -68,7 +68,6 @@
  "fx67": "Predeterminado (Calidad completa en este PC)",
  "fx68": "Más rápido (predeterminado en este PC)",
  "fx69": "Calidad completa (predeterminado en este PC)",
- "fx70": "Prompts largos más rápidos",
  "fx71": "Respuestas más rápidas en Radeon RX 9000 / AI PRO R9700",
  "fx72": "Aceleraciones de DeepSeek",
  "fx73": "Lee prompts muy largos más rápido aproximando una parte del trabajo. Desactivado de forma predeterminada: las respuestas sobre documentos largos pueden omitir o confundir detalles.",
@@ -80,6 +79,5 @@
  "fx79": "Desactivado (recomendado)",
  "fx80": "Necesita unos {0} GB de espacio libre en disco. Lo que no cabe en memoria se lee de tu SSD.",
  "fx81": "{0} de RAM + VRAM, más unos {1} GB de disco",
- "fx82": "Respuestas más rápidas en tarjetas NVIDIA de 12 GB",
  "fx83": "Prefiere las partes del modelo que ya están en la tarjeta gráfica, lo que hace las respuestas mucho más rápidas en tarjetas de 12 GB. Desactívalo si las respuestas parecen peores que antes."
 }

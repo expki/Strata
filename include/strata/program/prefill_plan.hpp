@@ -148,6 +148,13 @@ inline int64_t balanced_chunk(int64_t tokens, int64_t cap, int64_t plan) {
     return best;
 }
 
+/// The link an AMD card adds beside a stage's when it may stream tier_cap of a layer's ram_per_layer RAM experts: all of it, or what the cap lets it take.
+inline double tier_link_gbps(double stage_gbps, double tier_gbps, double ram_per_layer, double tier_cap) {
+    if (stage_gbps <= 0.0 || tier_gbps <= 0.0 || tier_cap <= 0.0) return 0.0;
+    if (ram_per_layer <= tier_cap) return tier_gbps;
+    return std::min(tier_gbps, stage_gbps * tier_cap / (ram_per_layer - tier_cap));   // its cap binds: it takes tier_cap while the stage copies the rest
+}
+
 /// One log line: what was chosen, why, and the reads it expects per prompt.
 inline std::string describe(const Pick& p, const Host& h, int64_t tokens) {
     char b[768];

@@ -21,6 +21,7 @@ namespace strata::prefill {
 namespace {
 
 constexpr int N = 2560, HC = 4, D = N * HC, LR = 320;
+static_assert(N == kCombineWidth && kCombineTop == 10, "the combine kernels read rows of N and 10 experts a token");
 constexpr int S = 128, HK = 16, HV = 48, C = 10240;
 
 __device__ __forceinline__ float warp_sum(float v) {
@@ -203,6 +204,111 @@ __global__ void __launch_bounds__(256) gr_write_norm_rs_kernel(float* __restrict
         if (xn16_lo) xn16_lo[xo + d] = bf_lo(x, h);
     }
 }
+// gr_mix_r_kernel four elements a thread with float4 loads and stores: each element's arithmetic and its order over the streams are the same.
+__global__ void __launch_bounds__(256) gr_mix_r_vec_kernel(const float4* __restrict__ R, const float* __restrict__ rs,
+                                                           const float4* __restrict__ w, const float4* __restrict__ g,
+                                                           float4* __restrict__ mixed, uint2* __restrict__ mixed16, int64_t T,
+                                                           uint2* __restrict__ mixed_h, uint2* __restrict__ mixed16_lo) {
+    constexpr int N4 = N / 4, D4 = D / 4;
+    const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= T * N4) return;
+    const int64_t t = i / N4, d4 = i % N4;
+    float s[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+#pragma unroll
+    for (int c = 0; c < HC; ++c) {
+        const int64_t j = t * D4 + c * N4 + d4;
+        const float4 r = R[j], gg = g[j], ww = w[c * N4 + d4];
+        const float rv = rs[t * HC + c];
+        const float rr[4] = {r.x, r.y, r.z, r.w}, ga[4] = {gg.x, gg.y, gg.z, gg.w}, wa[4] = {ww.x, ww.y, ww.z, ww.w};
+#pragma unroll
+        for (int e = 0; e < 4; ++e) {
+            const float x = rr[e] * rv * wa[e];
+            s[e] = fmaf(x, sigm(ga[e]), s[e]);
+        }
+    }
+#pragma unroll
+    for (int e = 0; e < 4; ++e) s[e] /= (float) HC;
+    mixed[i] = make_float4(s[0], s[1], s[2], s[3]);
+    auto pack = [](uint16_t a, uint16_t b, uint16_t c2, uint16_t d) {
+        return make_uint2((uint32_t) a | ((uint32_t) b << 16), (uint32_t) c2 | ((uint32_t) d << 16));
+    };
+    if (mixed16) {
+        uint16_t h[4], lo[4];
+#pragma unroll
+        for (int e = 0; e < 4; ++e) {
+            h[e] = act16(s[e]);
+            lo[e] = bf_lo(s[e], h[e]);
+        }
+        mixed16[i] = pack(h[0], h[1], h[2], h[3]);
+        if (mixed16_lo) mixed16_lo[i] = pack(lo[0], lo[1], lo[2], lo[3]);
+    }
+    if (mixed_h) mixed_h[i] = pack(hf(s[0]), hf(s[1]), hf(s[2]), hf(s[3]));
+}
+// gr_write_norm_rs_kernel with float4 loads and stores: each thread sums its old elements (d = tid + 256 k) from shared memory in the old order, so rs is the same bits.
+__global__ void __launch_bounds__(256) gr_write_norm_rs_vec_kernel(float* __restrict__ R, const float* __restrict__ bo,
+                                                                   const float* __restrict__ inj, int64_t inj_ld,
+                                                                   const float* __restrict__ w, float eps,
+                                                                   float* __restrict__ rs_out, uint16_t* __restrict__ xn16,
+                                                                   uint16_t* __restrict__ xn16_lo, int64_t ldx, int f16img) {
+    constexpr int N4 = N / 4, PER4 = (N4 + 255) / 256;
+    __shared__ float sh[32];
+    __shared__ __align__(16) float xs[N];
+    const int64_t row = blockIdx.x;                 // t * 4 + c
+    const int64_t t = row / HC;
+    const int c = (int) (row % HC);
+    float4* r4 = (float4*) (R + row * N);
+    const float4* b4 = (const float4*) (bo + t * N);
+    const float4* w4 = (const float4*) (w + c * N);
+    const int64_t xo = t * ldx + (int64_t) c * N;
+    const float sc = 2.0f * sigm(inj[t * inj_ld + c] / (float) HC);
+    float4 v[PER4];
+#pragma unroll
+    for (int k = 0; k < PER4; ++k) {
+        const int q = threadIdx.x + 256 * k;
+        if (q >= N4) break;
+        const float4 a = r4[q], b = b4[q];
+        const float4 x = make_float4(fmaf(b.x, sc, a.x), fmaf(b.y, sc, a.y), fmaf(b.z, sc, a.z), fmaf(b.w, sc, a.w));
+        r4[q] = x;
+        v[k] = x;
+        ((float4*) xs)[q] = x;
+    }
+    __syncthreads();
+    float ss = 0.0f;
+#pragma unroll
+    for (int d = threadIdx.x; d < N; d += 256) {
+        const float x = xs[d];
+        ss += x * x;
+    }
+    const float rs = rsqrtf(block_sum(ss, sh) / (float) N + eps);
+    if (threadIdx.x == 0) rs_out[row] = rs;
+    uint2* x2 = (uint2*) (xn16 + xo);
+    uint2* l2 = xn16_lo ? (uint2*) (xn16_lo + xo) : nullptr;
+#pragma unroll
+    for (int k = 0; k < PER4; ++k) {
+        const int q = threadIdx.x + 256 * k;
+        if (q >= N4) break;
+        const float4 ww = w4[q];
+        const float xv[4] = {v[k].x * rs * ww.x, v[k].y * rs * ww.y, v[k].z * rs * ww.z, v[k].w * rs * ww.w};
+        uint16_t h[4], lo[4];
+#pragma unroll
+        for (int e = 0; e < 4; ++e) {
+            const uint16_t hb = act16(xv[e]);
+            h[e] = f16img ? bf_to_hf_conv(hb) : hb;
+            lo[e] = bf_lo(xv[e], hb);
+        }
+        x2[q] = make_uint2((uint32_t) h[0] | ((uint32_t) h[1] << 16), (uint32_t) h[2] | ((uint32_t) h[3] << 16));
+        if (l2) l2[q] = make_uint2((uint32_t) lo[0] | ((uint32_t) lo[1] << 16), (uint32_t) lo[2] | ((uint32_t) lo[3] << 16));
+    }
+}
+// STRATA_HC_VEC=0 (or set_hc_vec(0)): the hyper-connection's write+norm and mix take the scalar kernels above.
+int g_hc_vec = -1;
+bool hc_vec() {
+    if (g_hc_vec >= 0) return g_hc_vec != 0;
+    static const bool on = [] { const char* e = std::getenv("STRATA_HC_VEC"); return !(e != nullptr && e[0] == '0'); }();
+    return on;
+}
+bool al16(const void* p) { return p == nullptr || ((uintptr_t) p & 15u) == 0; }
+bool al8(const void* p) { return p == nullptr || ((uintptr_t) p & 7u) == 0; }
 // S23 (opt-in STRATA_CVEC_FUSE=1): a steered layer's FFN write, its control vector and the next half's norm in one
 // pass over R (was gr_write + cvec_apply + gr_norm_rs: three).  The write is gr_write_kernel's, the vector
 // cvec_kernel's (the same per-thread dot order over d = tid + 256 k, the same two-level xor reduction), the norm
@@ -2574,6 +2680,13 @@ void gr_norm_rs(const float* R, const float* w_norm, float eps, float* rs, uint1
 }
 void gr_mix_r(const float* R, const float* rs, const float* w_norm, const float* gated, float* mixed, uint16_t* mixed16,
               int64_t T, void* stream, uint16_t* mixed_h, uint16_t* mixed16_lo) {
+    if (hc_vec() && al16(R) && al16(w_norm) && al16(gated) && al16(mixed) && al8(mixed16) && al8(mixed_h) && al8(mixed16_lo)) {
+        gr_mix_r_vec_kernel<<<blocks_for(T * (N / 4)), 256, 0, (cudaStream_t) stream>>>(
+            (const float4*) R, rs, (const float4*) w_norm, (const float4*) gated, (float4*) mixed, (uint2*) mixed16, T,
+            (uint2*) mixed_h, (uint2*) mixed16_lo);
+        check("gr_mix_r (vec)");
+        return;
+    }
     gr_mix_r_kernel<<<blocks_for(T * N), 256, 0, (cudaStream_t) stream>>>(R, rs, w_norm, gated, mixed, mixed16, T,
                                                                           mixed_h, mixed16_lo);
     check("gr_mix_r");
@@ -2609,8 +2722,16 @@ bool gr_upmix(const uint16_t* lo16, const uint16_t* w_up, const float* R, const 
     return true;
 #endif
 }
+void set_hc_vec(int mode) { g_hc_vec = mode; }
 void gr_write_norm_rs(float* R, const float* bo, const float* inj, int64_t inj_ld, const float* w_norm_next, float eps,
                       float* rs, uint16_t* xn16, int64_t T, void* stream, uint16_t* xn16_lo, int64_t ldx, bool f16img) {
+    const int64_t lx = ldx > 0 ? ldx : D;
+    if (hc_vec() && lx % 4 == 0 && al16(R) && al16(bo) && al16(w_norm_next) && al8(xn16) && al8(xn16_lo)) {
+        gr_write_norm_rs_vec_kernel<<<(unsigned) (T * HC), 256, 0, (cudaStream_t) stream>>>(R, bo, inj, inj_ld, w_norm_next, eps,
+                                                                                              rs, xn16, xn16_lo, lx, f16img ? 1 : 0);
+        check("gr_write_norm_rs (vec)");
+        return;
+    }
     gr_write_norm_rs_kernel<<<(unsigned) (T * HC), 256, 0, (cudaStream_t) stream>>>(R, bo, inj, inj_ld, w_norm_next, eps,
                                                                                       rs, xn16, xn16_lo,
                                                                                       ldx > 0 ? ldx : D, f16img ? 1 : 0);
@@ -2664,11 +2785,10 @@ void gdn_conv(float* history, const float* qkv, const float* conv_w, float* h, i
     gdn_l2_kernel<<<dim3(2 * HK, (unsigned) T), S, 0, (cudaStream_t) stream>>>(h, eps);
     check("gdn_conv");
 }
-// The recurrence dispatch, shared by the two entry points below so the state-only form cannot drift from the full
-// one.  `with_out` false runs exactly the same kernels minus the output normalization (the CUDA-only KVA path).
+// The recurrence dispatch, shared by the two entry points below.
 static void gdn_recurrence_impl(int variant, float* state, const float* h, const float* gate, const float* beta,
                                 const float* z, const float* gamma, float eps, float* y, uint16_t* y16, int64_t T,
-                                void* stream, int64_t ld16, bool with_out) {
+                                void* stream, int64_t ld16) {
     if (ld16 <= 0) ld16 = (int64_t) HV * S;
     static const bool serial = std::getenv("STRATA_GDN_REC_HEADS") != nullptr;   // the one-block-per-head kernel (A/B)
 #if defined(__HIPCC__)
@@ -2684,8 +2804,7 @@ static void gdn_recurrence_impl(int variant, float* state, const float* h, const
     if (variant == 3) {   // diagnostics: the quad recurrence + the old norm kernel
         if (T > 0) {
             gdn_rec_quad_kernel<<<HV * (S / QCB), QTH, 0, (cudaStream_t) stream>>>(state, h, gate, beta, y, T);
-            if (with_out)
-                gdn_out_norm_kernel<<<dim3((unsigned) T, HV), S, 0, (cudaStream_t) stream>>>(z, gamma, eps, y, y16, ld16);
+            gdn_out_norm_kernel<<<dim3((unsigned) T, HV), S, 0, (cudaStream_t) stream>>>(z, gamma, eps, y, y16, ld16);
         }
         return;
     }
@@ -2695,9 +2814,8 @@ static void gdn_recurrence_impl(int variant, float* state, const float* h, const
                 gdn_rec_quad2c_kernel<<<HV * (S / C2CB), QTH, 0, (cudaStream_t) stream>>>(state, h, gate, beta, y, T);
             else
                 gdn_rec_quad_pp_kernel<<<HV * (S / QCB), QTH, 0, (cudaStream_t) stream>>>(state, h, gate, beta, y, T);
-            if (with_out)
-                gdn_out_norm_loop_kernel<true><<<(unsigned) std::min<int64_t>(T * HV, 4096), S, 0, (cudaStream_t) stream>>>(
-                    z, gamma, eps, y, y16, T * HV, ld16);
+            gdn_out_norm_loop_kernel<true><<<(unsigned) std::min<int64_t>(T * HV, 4096), S, 0, (cudaStream_t) stream>>>(
+                z, gamma, eps, y, y16, T * HV, ld16);
         }
         check("gdn_recurrence (quad pp)");
         return;
@@ -2712,10 +2830,10 @@ static void gdn_recurrence_impl(int variant, float* state, const float* h, const
             else
                 gdn_rec_quad_kernel<<<HV * (S / QCB), QTH, 0, (cudaStream_t) stream>>>(state, h, gate, beta, y, T);
             static const bool noy = [] { const char* v = std::getenv("STRATA_GDN_NOY"); return v && std::atoi(v) != 0; }();
-            if (with_out && noy)
+            if (noy)
                 gdn_out_norm_loop_kernel<false><<<(unsigned) std::min<int64_t>(T * HV, 4096), S, 0, (cudaStream_t) stream>>>(
                     z, gamma, eps, y, y16, T * HV, ld16);
-            else if (with_out)
+            else
                 gdn_out_norm_loop_kernel<true><<<(unsigned) std::min<int64_t>(T * HV, 4096), S, 0, (cudaStream_t) stream>>>(
                     z, gamma, eps, y, y16, T * HV, ld16);
         }
@@ -2751,8 +2869,7 @@ static void gdn_recurrence_impl(int variant, float* state, const float* h, const
         if (T > T64)
             gdn_rec_cols_pipe_kernel<<<HV * NCB, dim3(CB, RG), 0, (cudaStream_t) stream>>>(
                 state, h + T64 * C, gate + T64 * HV, beta + T64 * HV, y + T64 * (size_t) HV * S, T - T64);
-        if (with_out)
-            gdn_out_norm_kernel<<<dim3((unsigned) T, HV), S, 0, (cudaStream_t) stream>>>(z, gamma, eps, y, y16, ld16);
+        gdn_out_norm_kernel<<<dim3((unsigned) T, HV), S, 0, (cudaStream_t) stream>>>(z, gamma, eps, y, y16, ld16);
     } else if (warp_rec) {
         // =2: the 4-accumulator chain split on the pipelined structure (FP32-level, not bit-exact);
         // =1: the sync-free bit-exact warp reduction (measured slower - kept as the bitwise control)
@@ -2761,11 +2878,10 @@ static void gdn_recurrence_impl(int variant, float* state, const float* h, const
                                                                                                 y, T);
         else
             gdn_rec_cols_warp_kernel<<<HV * NCB, S, 0, (cudaStream_t) stream>>>(state, h, gate, beta, y, T);
-        if (with_out)
-            gdn_out_norm_kernel<<<dim3((unsigned) T, HV), S, 0, (cudaStream_t) stream>>>(z, gamma, eps, y, y16, ld16);
+        gdn_out_norm_kernel<<<dim3((unsigned) T, HV), S, 0, (cudaStream_t) stream>>>(z, gamma, eps, y, y16, ld16);
     } else
 #endif
-    if ((serial && with_out) || T <= 0 || variant == 2) {   // the fused kernel needs z/gamma: only with the output
+    if (serial || T <= 0 || variant == 2) {
         gdn_rec_kernel<<<HV, dim3(S, RG), 0, (cudaStream_t) stream>>>(state, h, gate, beta, z, gamma, eps, y, y16, T, ld16);
     } else {
         static const bool pipe = [] { const char* v = std::getenv("STRATA_GDN_PIPELINE"); return v == nullptr || std::atoi(v) != 0; }();
@@ -2787,15 +2903,14 @@ static void gdn_recurrence_impl(int variant, float* state, const float* h, const
             gdn_rec_cols_pipe_kernel<<<HV * NCB, dim3(CB, RG), 0, (cudaStream_t) stream>>>(state, h, gate, beta, y, T);
         else
             gdn_rec_cols_kernel<<<HV * NCB, dim3(CB, RG), 0, (cudaStream_t) stream>>>(state, h, gate, beta, y, T);
-        if (with_out)
-            gdn_out_norm_kernel<<<dim3((unsigned) T, HV), S, 0, (cudaStream_t) stream>>>(z, gamma, eps, y, y16, ld16);
+        gdn_out_norm_kernel<<<dim3((unsigned) T, HV), S, 0, (cudaStream_t) stream>>>(z, gamma, eps, y, y16, ld16);
     }
     check("gdn_recurrence");
 }
 void gdn_recurrence_variant(int variant, float* state, const float* h, const float* gate, const float* beta,
                             const float* z, const float* gamma, float eps, float* y, uint16_t* y16, int64_t T,
                             void* stream, int64_t ld16) {
-    gdn_recurrence_impl(variant, state, h, gate, beta, z, gamma, eps, y, y16, T, stream, ld16, /*with_out=*/true);
+    gdn_recurrence_impl(variant, state, h, gate, beta, z, gamma, eps, y, y16, T, stream, ld16);
 }
 void gdn_recurrence(float* state, const float* h, const float* gate, const float* beta, const float* z,
                     const float* gamma, float eps, float* y, uint16_t* y16, int64_t T, void* stream, int64_t ld16) {
@@ -2804,17 +2919,7 @@ void gdn_recurrence(float* state, const float* h, const float* gate, const float
     // (AMD builds only; the arch defaults set STRATA_GDN_HEAD=1 on gfx1151 and leave other cards on the earlier kernels)
     static const bool head = [] { const char* v = std::getenv("STRATA_GDN_HEAD"); return v != nullptr && std::atoi(v) != 0; }();
     static const bool serial = std::getenv("STRATA_GDN_REC_HEADS") != nullptr;
-    gdn_recurrence_impl(head && !serial ? 1 : 0, state, h, gate, beta, z, gamma, eps, y, y16, T, stream, ld16, true);
-}
-/// KVA: the same recurrence, bit for bit, without the output normalisation (its readers - the output projection
-/// and the gated residual write - have no consumer when only the state advances).  `y` is still the scratch the
-/// recurrence kernels write; `z`/`gamma` are not read.
-void gdn_recurrence_state_only(float* state, const float* h, const float* gate, const float* beta, float* y,
-                               int64_t T, void* stream) {
-    static const bool head = [] { const char* v = std::getenv("STRATA_GDN_HEAD"); return v != nullptr && std::atoi(v) != 0; }();
-    static const bool serial = std::getenv("STRATA_GDN_REC_HEADS") != nullptr;
-    gdn_recurrence_impl(head && !serial ? 1 : 0, state, h, gate, beta, nullptr, nullptr, 0.0f, y, nullptr, T,
-                        stream, 0, /*with_out=*/false);
+    gdn_recurrence_impl(head && !serial ? 1 : 0, state, h, gate, beta, z, gamma, eps, y, y16, T, stream, ld16);
 }
 void route(const float* logits, int32_t* ids, float* weights, int64_t T, int64_t n_expert, void* stream) {
     if (n_expert == 512)

@@ -45,21 +45,10 @@ inline bool sm120_default(int major, int minor) { return is_sm120(major, minor) 
 // ---- 0.2.7 defaults of the CUDA speed work (pure rules; the engine reads the device and calls these; tests in arch_defaults_test)
 // `hip`: a HIP build, where a gfx1200 / gfx1201 reports compute capability 12.0 as well and none of these is measured or wanted.
 // `v026`: STRATA_DEFAULTS=026 (defaults_026.hpp qwen_defaults_026()): every one of these is then off, as in v0.2.6.  An explicit variable
-// (STRATA_ROUTE_PRIOR=2, STRATA_GR_V3=1, ...) is decided by the caller before it asks the rule, so it still wins.
+// (STRATA_GR_V3=1, ...) is decided by the caller before it asks the rule, so it still wins.
 // `total_bytes`: the card's memory (cudaDeviceProp::totalGlobalMem); `integrated`: a GPU that shares the PC's memory.
+// The route prior default of upstream 0.2.7 (residency-biased routing on small cards) is removed: routing never favors the experts a card holds.
 constexpr double kSmallCardGiB = 13.0;   // "a 12 GB card": 12 GB cards report 11.6 - 12.0 GiB, 16 GB ones 15.6 - 16.0
-
-/// The residency-bias bonus a discrete CUDA card of 13 GiB or less gets when the user set nothing: THE one place the value lives.  1.5 since the
-/// owner decision of 2026-10-26 (it was 2.0 in the first 0.2.7 candidates): on the RTX 3060 12 GB with IQ3_XXS the copy and code check found real
-/// defects at 2.0 and none in 19 tasks at 1.5 or 1.0, and 1.5 keeps the speed (story +15%, code +37% against off).  A longer 61-task check of
-/// 0 / 1.5 / 2.0 is still running; if it shows defects at 1.5 this falls back to 1.0.
-constexpr float kRoutePriorSmallCard = 1.5f;
-
-/// STRATA_ROUTE_PRIOR when the user set nothing: kRoutePriorSmallCard (residency-biased routing, changes which experts run; owner-approved for 12 GB
-/// cards) on a discrete CUDA card of 13 GiB or less, 0 everywhere else.  Measured on an RTX 3060 12 GB only.
-inline float route_prior_default(bool hip, bool integrated, double total_bytes, bool v026 = false) {
-    return !v026 && !hip && !integrated && total_bytes > 0.0 && total_bytes / 1073741824.0 <= kSmallCardGiB ? kRoutePriorSmallCard : 0.0f;
-}
 
 /// STRATA_GR_V3 (the stream-split hyper-connection read, another summation order) when the user set nothing: ON for a discrete compute capability
 /// 12.0 card (STRATA_SM120_PERF=0 turns the set off) with more than 13 GiB, CUDA builds only.  Measured: RTX PRO 5000 72 GB +1.2% decode clean,
@@ -102,7 +91,7 @@ inline bool gr_up_wide_default(bool hip, int major, int minor, bool v026 = false
 /// per chunk; another summation order of the routed experts, so KL-checked, not bitwise) when the user set nothing: ON for a CUDA layer split
 /// (`stages` = the number of GPUs the prompt path runs on, 2 or more), OFF on one GPU, in a HIP build and under STRATA_DEFAULTS=026.  Measured on
 /// 2x RTX A4000 (sm_86) with Qwen3.8-Flash-Next IQ3_XXS and streamed experts only.  The engine adds its own per-prompt declines (image prompts,
-/// DFlash2 taps, KVA, a batch read that yields, a peer GPU, no VRAM for a super-chunk): those read the chunk-major path as before.
+/// DFlash2 taps, a batch read that yields, a peer GPU, no VRAM for a super-chunk): those read the chunk-major path as before.
 inline bool prefill_layer_major_default(bool hip, int stages, bool v026 = false) { return !v026 && !hip && stages >= 2; }
 
 /// The answer for STRATA_PREFILL_LAYER_MAJOR given the variable's text (nullptr = unset): any text that starts a number other than 0 is on, "0" (or any

@@ -2,6 +2,17 @@
 
 The app and the Terminal are 0.2.7. Control and every engine package (Qwen and DeepSeek) are 0.1.52, because both engines changed.
 
+**This fork leaves out three of these items.** Each one changes which experts run or skips work the model would do. They are
+removed, not just off:
+
+- The route prior on NVIDIA cards of 12 GB or less, and its "Faster answers on 12 GB NVIDIA cards" switch. `STRATA_ROUTE_PRIOR`
+  only prints that it was removed.
+- DeepSeek's five experts per word on four R9700 cards. Every word takes all 6 of its experts.
+- "Faster long prompts" (KVA, `STRATA_KVA`) and its switch. `STRATA_KVA` only prints that it was removed, and every prompt is read
+  exactly.
+
+The rest of these notes is upstream's text.
+
 ## What you will notice
 
 - **NVIDIA cards with 12 GB or less answer faster.** The router now prefers experts that are already on the card, which saves page-ins from RAM. On an RTX 3060 12 GB (Qwen3.8-Flash-Next IQ3_XXS, five paired runs against the same build with the setting off), a story answer went from 46.2 to 53.1 tok/s (+15%) and a code answer from 45.7 to 62.5 tok/s (+37%). It picks a slightly different set of experts, so the wording of answers changes. We checked the answers on that card (IQ3_XXS) with 80 tasks and saw no copy or code errors. Agent loops may finish slightly less often, within the run-to-run spread: out of 10 agent tasks, 4.5 passed on average over 4 runs at 1.5, against 5.6 over 7 runs with the setting off, where the off runs alone ranged from 4 to 6. A stronger setting (2.0) did show copy and code defects, so the default is 1.5. It applies to a discrete NVIDIA card of 13 GiB or less; larger cards, Radeon and Strix Halo are not changed. Off: the row "Faster answers on 12 GB NVIDIA cards" in the Expert settings (Models, Native engine settings, Speed), or `STRATA_ROUTE_PRIOR=0`.

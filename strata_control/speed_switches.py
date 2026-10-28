@@ -5,12 +5,12 @@ its default it removes those entries, so a default launch carries none of them a
 contract (phaseA-tests/notes-027-plan.md).  The app does the same in apps/host/server/native-settings.mjs (SPEED_SWITCHES); tests/terminal/test_speed_switches.py
 reads that file and fails when the two disagree, so the Terminal and the app cannot drift apart.
 
-- "Faster long prompts" (Qwen KVA) is OFF by default (owner decision, 26 October): ``STRATA_KVA=1`` turns it on.  A file that holds ``STRATA_KVA=0`` (the
-  off switch of an earlier 0.2.7 test build) reads as off, which is what it is now.
 - "Faster answers on Radeon RX 9000 / AI PRO R9700" and "DeepSeek speed-ups" are ON by default; turning them off writes their entries.
+- This fork has no "Faster long prompts" (KVA) and no "Faster answers on 12 GB NVIDIA cards" (the route prior): both change which work or which experts
+  run, so the engine features and their rows were removed.
 
-The Terminal shows the switches as rows of its Advanced table (strata_cli/launch/params.py), only where they apply: ``strata launch --set STRATA_KVA=1``
-turns "Faster long prompts" on, ``--set STRATA_KVA=off`` puts the default back (the same as removing the row).
+The Terminal shows the switches as rows of its Advanced table (strata_cli/launch/params.py), only where they apply: ``strata launch --set STRATA_PCIE_FRAC_DEFAULT=old``
+turns "Faster answers on Radeon RX 9000" off, ``--set STRATA_PCIE_FRAC_DEFAULT=off`` puts the default back (the same as removing the row).
 """
 
 from __future__ import annotations
@@ -26,19 +26,13 @@ class Switch:
     label: str                    # the words the app shows
     effect: str                   # one plain sentence: what it does and what the other choice does
     env: tuple[tuple[str, str], ...]   # the environment entries written when the switch is NOT in its default state
-    only: str                     # "qwen-gpu" | "qwen-cuda-12gb" | "qwen-radeon-9000" | "deepseek" | "qwen-any": where it applies
+    only: str                     # "qwen-radeon-9000" | "deepseek" | "qwen-any": where it applies
     default: str = "on"           # "on" | "off": what a launch without the entries does
     legacy: tuple[tuple[str, str], ...] = ()    # entries an earlier 0.2.7 test build wrote for the same state: they read as the switch being set, and are removed with it
     terminal_only: bool = False   # shown in the Terminal's Advanced table only, never in the app
 
 
 SWITCHES: tuple[Switch, ...] = (
-    Switch("faster_long_prompts", "Faster long prompts",
-           "Reads very long prompts faster by approximating part of the work. Off by default: answers about long documents can miss or mix up details.",
-           (("STRATA_KVA", "1"),), "qwen-gpu", default="off"),
-    Switch("faster_12gb_nvidia", "Faster answers on 12 GB NVIDIA cards",
-           "Prefers the parts of the model already on the graphics card, which makes answers much faster on 12 GB cards. Turn off if answers look worse than before.",
-           (("STRATA_ROUTE_PRIOR", "0"),), "qwen-cuda-12gb"),
     Switch("faster_radeon_9000", "Faster answers on Radeon RX 9000 / AI PRO R9700",
            "Shares the work between the graphics card and the processor in a way that makes answers faster on these cards. "
            "Turn off to go back to the previous setting, which is slower.",
@@ -63,20 +57,6 @@ _GFX12 = re.compile(r"^gfx120[01]$", re.IGNORECASE)
 _RADEON_9000 = re.compile(r"\b(?:RX\s*9\d{3}|AI\s*PRO\s*R97\d{2}|R97\d{2})\b", re.IGNORECASE)
 
 
-def _small_nvidia(gpus: Iterable[Mapping[str, Any]] | None) -> bool:
-    """A discrete NVIDIA card of 13 GiB or less (the engine's rule for residency-biased routing: not an integrated chip, not a card that shares system memory)."""
-    for g in gpus or []:
-        if g.get("usable") is False or g.get("uma") or g.get("integrated") or (g.get("unified_gb") or 0) > 0:
-            continue
-        vendor = str(g.get("vendor") or "").lower()
-        if vendor not in ("nvidia", "") or (vendor == "" and not re.search(r"nvidia|geforce|\brtx\b|\bgtx\b|quadro|tesla", str(g.get("name") or ""), re.IGNORECASE)):
-            continue
-        vram = float(g.get("vram_gb") or 0)
-        if 0 < vram <= 13.0:
-            return True
-    return False
-
-
 def is_deepseek(cfg: Mapping[str, Any] | None) -> bool:
     cfg = cfg or {}
     return cfg.get("arch") == "deepseek41" or bool(re.search(r"strata-dsv41", str(cfg.get("exe") or ""), re.IGNORECASE))
@@ -93,8 +73,7 @@ def _radeon_9000(gpus: Iterable[Mapping[str, Any]] | None) -> bool:
 
 
 def applies(switch: Switch | str, cfg: Mapping[str, Any] | None, gpus: Iterable[Mapping[str, Any]] | None, backend: str | None = None) -> bool:
-    """Does the switch make sense for this model on this PC? ``backend`` is the engine's (cuda, hip, sycl, metal, cpu); the run config's own wins.
-    "Faster long prompts" is for Qwen3.8-Flash-Next models only (a config without an "arch")."""
+    """Does the switch make sense for this model on this PC? ``backend`` is the engine's (cuda, hip, sycl, metal, cpu); the run config's own wins."""
     sw = BY_ID[switch] if isinstance(switch, str) else switch
     if sw.only == "deepseek":
         return is_deepseek(cfg)
@@ -103,13 +82,6 @@ def applies(switch: Switch | str, cfg: Mapping[str, Any] | None, gpus: Iterable[
     if sw.only == "qwen-any":
         return True
     backend = (cfg or {}).get("backend") or backend
-    if sw.only == "qwen-gpu":
-        # KVA was measured on the Qwen3.8-Flash-Next shape (48 layers, 512 experts); the engine declines any other.  Setup writes "arch" only for the
-        # families with an engine path of their own (Qwen3.6-35B-A3B: qwen35moe), so a Flash-Next config (the original, Swift, Coder, Unsloth, Gyro, NVFP4) has none.
-        return not (cfg or {}).get("arch") and backend in ("cuda", "hip")
-    if sw.only == "qwen-cuda-12gb":
-        # the engine's residency-biased routing needs the Flash-Next shape (512 experts, top-10) and a CUDA build; a Qwen3.6 config has an "arch"
-        return not (cfg or {}).get("arch") and backend == "cuda" and _small_nvidia(gpus)
     if sw.only == "qwen-radeon-9000":
         return backend == "hip" and _radeon_9000(gpus)
     return False
@@ -127,7 +99,7 @@ def app_switches() -> list[Switch]:
 
 def is_set(env: Mapping[str, Any] | None, switch: Switch | str) -> bool:
     """Every entry the switch writes is there with its value (the switch is out of its default).  A file with only some of them, or other values
-    (``STRATA_KVA=0``), is in the default state and is left alone."""
+    is in the default state and is left alone."""
     sw = BY_ID[switch] if isinstance(switch, str) else switch
     have = lambda entries: bool(entries) and all((env or {}).get(name) == value for name, value in entries)   # noqa: E731
     return have(sw.env) or have(sw.legacy)

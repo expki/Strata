@@ -137,7 +137,7 @@ strata launch --family deepseek41 --model ist-das-2.00bpw
 | `ud-q8_k_xl` | 508 GB |
 
 - The context is 8192 tokens (8K), the size the engine was checked at.
-- `--speed faster|full` picks how many of the model's 6 experts it uses per word. Faster uses 5 (a small quality change, usually not noticeable) and is the default on a PC with 16 GB of graphics memory or less and on PCs whose graphics share the computer's memory. Full uses all 6. `--full-quality` is the same as `--speed full`. Both need DeepSeek engine 0.1.50 or newer, which `strata launch` fetches. The engine's own flag is `--experts N`.
+- Every word takes all 6 of the model's experts. The Faster mode is removed: `--speed` and `--full-quality` are still accepted from older scripts, with a note that they are not used.
 - It answers one request at a time. `--parallel` above 1 is ignored with a note.
 - It reads pictures (on by default) with the engine's own vision tower, loaded with the model; `--vision off` turns them off. Setup fetches the tower's weights (mmproj-BF16.gguf, 1 GB) with the other shared files and packs them with the model.
 - `--tune` runs DeepSeek's own short tuner (drafter on or off, CPU threads), not the Qwen tuner.

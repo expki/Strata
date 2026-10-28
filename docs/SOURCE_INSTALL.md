@@ -80,8 +80,19 @@ cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DSTRATA_ENABLE_CUDA=ON -DCMAKE_C
 cmake --build build --target strata -j8
 ```
 
+The NVIDIA build needs CUDA 12.1 or newer. One prompt kernel (`moe_fused_iq.cu`) takes 4,216 bytes of kernel parameters,
+and CUDA 12.0 allows only 4,096. On the test box `/usr/bin/nvcc` (12.0) fails and `/usr/local/cuda` (13.2) works. When an
+older `nvcc` comes first on the PATH, add `-DCMAKE_CUDA_COMPILER=/usr/local/cuda/bin/nvcc` to the first command.
+
 `native` builds for the GPUs in this PC. Name the card instead for another one: `75` (RTX 20), `86` (RTX 30), `89` (RTX 40),
 `120` (RTX 50), or a list such as `"86;120"`. Without the option the build is for RTX 50 only and the configure step says so.
+
+This build is for the PC it was built on: Strata's own C++ code gets `-march=native` (`STRATA_MARCH_NATIVE`, on unless
+`STRATA_PORTABLE` or `STRATA_ISA_FLOOR` is set; ggml's CPU code already had it). Its float results are the same as without it
+(`-ffp-contract=off`, the same answers measured). On an EPYC 7F52 with an RTX 3090 at 1500 MHz and a W6800 on its
+automatic clocks (Swift 1.5 Q6_K, two starts each) the 8K answers decoded 52.8 -> 54.9 tok/s (every start faster), the
+20K answers 62.5 -> 67.4 and the chats 38.2 -> 40.7 (both inside the spread between starts, so not resolved), prompts the
+same. `-DSTRATA_MARCH_NATIVE=OFF` builds an engine to copy to another PC.
 
 Run against the resulting binary and the matching model config. Use the build instructions for
 [HIP](AMD_HIP.md), [SYCL](INTEL_ARC.md) or [Metal](MAC.md) when changing those backends.

@@ -14,7 +14,7 @@ struct OnDevice {
         if (device >= 0 && cudaGetDevice(&cur) == cudaSuccess && cur != device && cudaSetDevice(device) == cudaSuccess)
             previous = cur;
     }
-    ~OnDevice() { if (previous >= 0) cudaSetDevice(previous); }
+    ~OnDevice() { if (previous >= 0) (void) cudaSetDevice(previous); }
     OnDevice(const OnDevice&) = delete;
     OnDevice& operator=(const OnDevice&) = delete;
 };

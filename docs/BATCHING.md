@@ -246,6 +246,12 @@ so the slots never wait for the read and the read is one run with no drain insid
   for the next launch, which wakes it (a timed sleep is a whole timer tick on Windows, up to 15.6 ms). A window that
   will not finish is still found (its graph ended with a layer still to ring, or no layer rang for 20 s), and the stall
   watchdog stays on for the whole read.
+- Where the read's threads run (Linux): its own thread, the doorbell thread, the prompt copy threads and the later
+  stages' loops keep off the host thread's core, which pumps the windows, and off the pool workers' CPUs, which compute
+  the windows' missing experts: the `--aux-cpus` set when it is on, else the CPUs no worker uses (on an SMT machine with
+  the default pool, the idle sibling threads), else the workers' CPUs, never the host's. With the read's threads on the
+  host's CPU the slots decoded 25.9 and 23.7 rows/s during a cold 32K read (2x RTX 5090, WSL2), and 75.6 and 62.8 off
+  it. `STRATA_PIPED_CONCURRENT_UNPIN=0` keeps the read's and the doorbell threads on the host's CPU (an A/B).
 - A waiting shorter request takes over at the read's next chunk (`BYIELD`), also when no slot decodes: the run ends
   there, the pipeline is drained and the part read waits in a slot, as off the pipeline. A read nobody waits for is not cut.
 - Off, said once, where the read's thread would allocate or free (`STRATA_PREFILL_HELP=1`, `STRATA_SPLIT_MTP_BATCH=1`),

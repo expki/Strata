@@ -5,7 +5,7 @@ shared by the CPU and the GPU). Strata runs there through the same HIP backend a
 **Status: experimental.**
 
 **DeepSeek V4.1-Flash runs here on Windows** (since 0.2.7): its own engine package is built for gfx1151 and the official IST-DAS
-1.75 / 2.00 / 2.25 bpw sets run through it. Measured on the 128 GB box (64 GB BIOS carve-out plus 64 GB seen by Windows) with 2.00 bpw and the default Faster mode, on the
+1.75 / 2.00 / 2.25 bpw sets run through it. Measured on the 128 GB box (64 GB BIOS carve-out plus 64 GB seen by Windows) with 2.00 bpw and upstream's Faster mode (5 of 6 experts; this fork removed it, so expect less), on the
 2026-10-25 build (before the DeepSeek defaults of 0.2.7): answers 15-17 tokens/s on code, 10-11 on chat; a 4K prompt 87 tokens/s, an 8K prompt 125 and a 32K prompt 177.
 On the 0.2.7 build the same box reads a 4K prompt at 214-233 tokens/s; the table below says which number comes from which build. The graphics chip and the CPU share the RAM, so the
 engine counts it once and reads the rest of the experts from the SSD. [DeepSeek on Strix Halo](#deepseek-v41-flash) has the details,
@@ -48,7 +48,7 @@ package is the AMD one built for gfx1151 (`strata-dsv41-...-windows-x86_64-hip-r
 | Context | 8K default; 32K and 64K work (an 8-hour 32K soak passed) |
 | Disk | the sets above; keep the files on the NVMe drive, they are read while it answers |
 
-Measured on the maintainers' box (Ryzen AI Max+ 395, 128 GB unified, Windows 11, 2.00 bpw, Faster mode, DSpark auto, engine 0.1.51) on 2026-10-25, with the
+Measured on the maintainers' box (Ryzen AI Max+ 395, 128 GB unified, Windows 11, 2.00 bpw, upstream's Faster mode (removed here), DSpark auto, engine 0.1.51) on 2026-10-25, with the
 build of that day and the DeepSeek stream's own test harness (before the 0.2.7 DeepSeek defaults; the 0.2.7 numbers are in the next table):
 
 | Workload | Result |
@@ -62,7 +62,7 @@ build of that day and the DeepSeek stream's own test harness (before the 0.2.7 D
 | Stability | 100-request, 1-hour (243 requests) and 8-hour 32K (646 requests) soaks passed on the engine line this package is built from |
 
 Measured again on 2026-10-26 on the same box with the 0.2.7 release candidate (f-027-int2 `3e468f5de`, engine 0.1.51), installed through `strata launch` from a local
-signed test feed, 2.00 bpw, Faster mode, DSpark auto, the default 8K context, `tools/strata_bench.py` through the server (three fresh prompts of 4,125
+signed test feed, 2.00 bpw, upstream's Faster mode (removed here), DSpark auto, the default 8K context, `tools/strata_bench.py` through the server (three fresh prompts of 4,125
 tokens, 24 new tokens; chat is the median of nine answers of up to 100 tokens). One change at a time, to see which one moved the 4K prompt:
 
 | Setup on the 0.2.7 candidate | 4K prompt (tok/s) | Chat decode (tok/s) |

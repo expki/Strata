@@ -116,11 +116,14 @@ tokens) and hands it to the engine; it needs Pillow for that (`python -m pip ins
 
 Not in this version: several requests at once (`--parallel` is ignored with a warning).
 
-## Speed: Faster or Full quality
+## Every expert, every word
 
-DeepSeek picks 6 experts for every word it writes. **Faster** uses 5 of them (engine flag `--experts 5`): a small quality change, usually not noticeable, and answers come sooner. It is the default on a PC whose graphics cards total 16 GiB or less, and on an integrated GPU such as Strix Halo: the engine decides that itself (`--experts auto`), and Strata passes `--experts` only when you choose. **Full quality** uses all 6 (`--experts 6`).
+DeepSeek picks 6 experts for every word it writes, and the engine computes all 6. The Faster mode that used 5 of them is removed.
 
-The choice needs the DeepSeek engine 0.1.50 or newer (0.1.49.2 does not take `--experts`); with an older engine the step and the plan line are left out and nothing is passed. In `strata launch` the guided screens have a Speed step for DeepSeek; with flags use `--speed faster|full`, or `--full-quality` in scripts. `strata launch --plan` shows which one this PC gets.
+- The engine still accepts `--experts N` from an older config. Below 6 it prints one line saying it is not used.
+- `DS4_TOPK` and `STRATA_DS4_DISK_SKIP_W` are gone too. When one of them is set, the engine prints a line and computes every expert.
+- `strata launch` still accepts `--speed` and `--full-quality` from older scripts. It says they are not used, drops a saved
+  `--experts` from the config, and starts.
 
 ## Tuning
 

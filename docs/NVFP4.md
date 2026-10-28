@@ -65,8 +65,8 @@ the bytes over PCIe. The PCIe share of the missed experts is therefore 0.25 for 
 0.55 the copy kernel was 40% of all GPU kernel time (nsys, 300-token decode). Measurements are in
 [History](#history--older-measurements).
 
-`STRATA_ROUTE_TAIL_SKIP` is off by default for NVFP4 experts, because it moves the answers by more than the quantization
-itself. `STRATA_ROUTE_TAIL_SKIP=7` turns it on.
+The engine computes every routed expert. The route tail skip (`STRATA_ROUTE_TAIL_SKIP`) is gone. It moved an NVFP4
+pack's answers by more than the quantization itself (the history below).
 
 ## Where the global scales go
 
@@ -252,14 +252,15 @@ PCIe share sweep at 262K context (decode tok/s):
 | --- | ---: | ---: | ---: |
 | NVFP4 GPTQ, experts on the CPU | 92.09% | 0.070 | 1.12 |
 | NVFP4 GPTQ, 1,500 experts on the GPU | 91.79% | 0.069 | 1.07 |
-| The same with `STRATA_ROUTE_TAIL_SKIP=7` | 88.59% | 0.118 | 1.76 |
+| The same with the route tail skip (removed since) | 88.59% | 0.118 | 1.76 |
 | NVFP4 GPTQ with the GSQ-RCO IQ4_NL n-gram table instead of the FP8 one | 92.15% | 0.069 | 1.07 |
 | For comparison, Unsloth UD-Q5_K_XL | 94.55% | 0.038 | 0.64 |
 | Unsloth UD-Q4_K_XL | 93.09% | 0.056 | - |
 | Unsloth UD-IQ4_XS | 88.91% | 0.101 | 1.60 |
 | GSQ-RCO IQ3_S | 87.69% | 0.144 | 1.98 |
 
-`STRATA_ROUTE_TAIL_SKIP=7` gave +7 to 25% decode on the RTX 3060 and +47 to 55% on the RTX 5070 (64 GB).
+The route tail skip gave +7 to 25% decode on the RTX 3060 and +47 to 55% on the RTX 5070 (64 GB). It is removed, so
+these numbers are history.
 
 > **Measured on:** decode experts (`nvfp4_decode_bench`, 64 distinct experts per call), share of the card's DRAM bandwidth
 > in brackets.

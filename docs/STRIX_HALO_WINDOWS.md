@@ -28,7 +28,7 @@ the engine's own timings; the model is loaded before the clock starts). The numb
 | 32K prompt | **792 tok/s** (40.6 s) |
 | Coding-agent session, 6 turns | 69% of the prompt came from the conversation cache; answers 47 tok/s; 4.5 s to the first token per turn |
 
-**DeepSeek V4.1-Flash 2.00 bpw** (`strata launch --family deepseek41 --model ist-das-2.00bpw`, Faster mode, the drafter on; the 4K row is
+**DeepSeek V4.1-Flash 2.00 bpw** (`strata launch --family deepseek41 --model ist-das-2.00bpw`, upstream's Faster mode (removed here), the drafter on; the 4K row is
 the default 8K context, the others 64K context with `--context 64k`):
 
 | Test | Result |
@@ -87,7 +87,8 @@ environment and the package's `rocm/bin` folder on the library path.
   gfx1151, version 100500)` in the log). A hand-built engine has to be pointed at it: [AMD_HIP.md](AMD_HIP.md).
 - `--mmap-experts` is not needed. The first Windows guide found that without it the pinned expert arena used up the graphics memory
   budget and decode fell to 28 tok/s on engine 0.1.41; the engine on this page sizes the cache from the shared pool and reaches every slot.
-- DeepSeek runs in "Faster" mode here: 5 of 6 experts per word. The app and `strata launch` say so; the quality change is small.
+- Upstream runs DeepSeek in "Faster" mode here: 5 of 6 experts per word. This fork removed that mode, so every word takes all 6
+  and the speeds above are higher than this fork gives.
 
 **`STRATA_SH_STREAM` (the shared expert on its own stream) is off by default on Windows `gfx1151` in 0.2.7, because it is slower there.** It stays
 on by default on Linux `gfx1151`, where it was measured to help ([STRIX_HALO.md](STRIX_HALO.md)). The first Windows guide found the Windows

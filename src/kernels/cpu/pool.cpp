@@ -728,6 +728,7 @@ void ExpertPool::diag(std::FILE* f) const {
     for (int i = 0; i < n_; ++i) {
         const int32_t s = wstate_[(size_t) i].load();
         if (s == kParked) std::fprintf(f, " w%d=parked", i);
+        else if (s == kRetired) std::fprintf(f, " w%d=retired", i);
         else if (s == kSleeping) std::fprintf(f, " w%d=sleeping", i);
         else if (s == kBetween) std::fprintf(f, " w%d=draining", i);
         else std::fprintf(f, " w%d=job%d", i, s);
@@ -845,6 +846,7 @@ ExpertPool::ExpertPool(int n_workers, bool pin, bool host_works, PoolAffinity af
     plan_cores_ = wplan.cores;
     plan_logical_ = plan_in.logical;
     if (n_ < 1) n_ = 1;
+    active_.store(n_);
     scratch_.resize((size_t) n_);
     wstate_.reset(new std::atomic<int32_t>[(size_t) n_]);
     for (int i = 0; i < n_; ++i) wstate_[(size_t) i].store(kParked);
@@ -853,6 +855,10 @@ ExpertPool::ExpertPool(int n_workers, bool pin, bool host_works, PoolAffinity af
     strata::core::diag_pool_fn().store(&diag_active_pool);
     split_.resize((size_t) kMaxSplit);
     split_multi_.resize((size_t) kMaxSplitMulti);
+    if (const char* v = std::getenv("STRATA_POOL_ONE_BATCH")) one_batch_ = std::atoi(v) != 0;
+    if (const char* v = std::getenv("STRATA_POOL_EVEN")) even_ = std::atoi(v) != 0;
+    gu_rows_.reset(new std::atomic<int32_t>[(size_t) kMaxSplitMulti]);
+    h_ready_.reset(new std::atomic<int32_t>[(size_t) kMaxSplitMulti]);
     // STRATA_NUMA_SPLIT: decided here, before any worker starts (a worker counts into its slice's `parked` from its
     // first instruction), and never revised.  Unset: the plan stays empty and nothing below runs.
     NumaSplitPlan plan;
@@ -955,7 +961,30 @@ ExpertPool::~ExpertPool() {
     stop_.store(true, std::memory_order_release);
     // Bump the epoch so a PARKED worker notices the stop flag rather than sleeping through it.
     publish();
+    {
+        std::lock_guard<std::mutex> lk(retire_mu_);
+        retire_cv_.notify_all();
+    }
     for (auto& t : threads_) t.join();
+}
+
+bool ExpertPool::set_active(int n) {
+    if (numa_n_ > 0) return false;
+    n = (std::min)((std::max)(n, 1), n_);
+    if (n == active_.load(std::memory_order_relaxed)) return true;
+    wait_parked("before changing the active workers");   // between batches: nobody is draining
+    hstate_.store(kIdle, std::memory_order_relaxed);
+    hstate_ms_.store(now_ms(), std::memory_order_relaxed);
+    active_.store(n, std::memory_order_seq_cst);
+    {
+        std::lock_guard<std::mutex> lk(sleep_mu_);   // a sleeper wakes to see it, a spinner sees it within a few microseconds
+        sleep_cv_.notify_all();
+    }
+    {
+        std::lock_guard<std::mutex> lk(retire_mu_);
+        retire_cv_.notify_all();
+    }
+    return true;
 }
 
 void ExpertPool::publish() {
@@ -979,6 +1008,14 @@ void ExpertPool::worker(int id) {
     // first call, which is the good case; a version that deadlocked on the second would be far worse.
     parked_of(id).fetch_add(1, std::memory_order_acq_rel);
     for (;;) {
+        if (id >= active_.load(std::memory_order_acquire)) {   // set_active parked this worker: it never leaves the park
+            std::unique_lock<std::mutex> lk(retire_mu_);
+            wstate_[(size_t) id].store(kRetired, std::memory_order_relaxed);
+            retire_cv_.wait(lk, [&] { return id < active_.load(std::memory_order_seq_cst) || stop_.load(std::memory_order_relaxed); });
+            wstate_[(size_t) id].store(kParked, std::memory_order_relaxed);
+            if (stop_.load(std::memory_order_acquire)) return;
+            continue;
+        }
         // Park: wait for work.  `_mm_pause` rather than a bare spin because it yields the pipeline to the
         // sibling hyperthread; `epoch_` is bumped once per LAYER, not once per expert, so most of these
         // iterations are spent here with nothing to do.
@@ -1013,17 +1050,20 @@ void ExpertPool::worker(int id) {
                 strata_cpu_pause();
                 if ((++spins & 1023u) != 0) continue;
             }
+            if (id >= active_.load(std::memory_order_relaxed)) break;
             if (std::chrono::steady_clock::now() - parked_at < spin_before_sleep_) continue;
             std::unique_lock<std::mutex> lk(sleep_mu_);
             wstate_[(size_t) id].store(kSleeping, std::memory_order_relaxed);
             sleepers_.fetch_add(1, std::memory_order_seq_cst);
             sleep_cv_.wait(lk, [&] {
-                return epoch_.load(std::memory_order_seq_cst) != seen || stop_.load(std::memory_order_relaxed);
+                return epoch_.load(std::memory_order_seq_cst) != seen || stop_.load(std::memory_order_relaxed) ||
+                       id >= active_.load(std::memory_order_seq_cst);
             });
             sleepers_.fetch_sub(1, std::memory_order_relaxed);
             wstate_[(size_t) id].store(kParked, std::memory_order_relaxed);
         }
         if (stop_.load(std::memory_order_acquire)) return;
+        if (epoch_.load(std::memory_order_acquire) == seen) continue;   // parked by set_active, no batch to join
         // acquire: the batch this epoch published (`head`, and the description before it) is visible from here
         seen = epoch_.load(std::memory_order_acquire);
         parked_of(id).fetch_sub(1, std::memory_order_acq_rel);   // leaving the park
@@ -1196,7 +1236,7 @@ void ExpertPool::drain(int id, ExpertScratch& scratch, uint32_t epoch) {
             const int e = (int) i / parts_b_, part = (int) i % parts_b_;
             const int r0 = H * part / parts_b_, r1 = H * (part + 1) / parts_b_;
             s2_expert_down_rows(jobs_[e].blob, split_[(size_t) e].a2, jobs_[e].out, r0, r1);
-        } else if (mode_ >= 5) {
+        } else if (mode_ == 5 || mode_ == 6) {
             // plan v0.3 P6: native layers, 5 = gate/up rows, 6 = down rows (the layer's own n_ff / n_embd: Flash-Next's
             // FF / H, or another family's smaller expert)
             // Task j of T over R rows of `h` per expert from matrix row `row0`: the whole phase (R = mrows_, h = per,
@@ -1214,42 +1254,30 @@ void ExpertPool::drain(int id, ExpertScratch& scratch, uint32_t epoch) {
                 const int e = (int) (g / h), l0 = (int) (g % h);
                 const int l1 = (int) std::min<int64_t>(h, l0 + (g1 - g));
                 const int r0 = row0 + l0, r1 = row0 + l1;
-                SplitBufMulti& sb = split_multi_[(size_t) e];
-                const NativeFmt* const nfmt = mjobs_[e].fmt != nullptr ? mjobs_[e].fmt : nfmt_;   // 149-cold: same types and rows
-                if (mode_ == 5 && q2_native_kernels(nfmt->gu_type)) {
-                    // a native Q2_0 pack: gate and up rows on the Q2_0 kernels, then SwiGLU
-                    thread_local float gbuf[MAXT][FF], ubuf[MAXT][FF];
-                    float* gp[MAXT];
-                    float* up[MAXT];
-                    for (int t = 0; t < mjobs_[e].nt; ++t) { gp[t] = gbuf[t]; up[t] = ubuf[t]; }
-                    const int nbk = (int) (nfmt->n_embd / 64);
-                    q2_rows_any(mjobs_[e].blob, nfmt->gu_row, nbk, mjobs_[e].act, mjobs_[e].nt, gp, r0, r1);
-                    q2_rows_any(mjobs_[e].blob + nfmt->up_off, nfmt->gu_row, nbk, mjobs_[e].act, mjobs_[e].nt, up, r0, r1);
-                    for (int t = 0; t < mjobs_[e].nt; ++t)
-                        for (int r = r0; r < r1; ++r)
-                            sb.ff[t][r] = (gbuf[t][r] / (1.f + std::exp(-gbuf[t][r]))) * ubuf[t][r];
-                } else if (mode_ == 5) {
-                    float* ff[MAXT];
-                    for (int t = 0; t < mjobs_[e].nt; ++t) ff[t] = sb.ff[t];
-                    if (narithmetic_ == NativeArithmetic::WindowInvariant)
-                        native_gu_rows_invariant(*nfmt, mjobs_[e].blob, mjobs_[e].nact, mjobs_[e].nt, ff, r0, r1);
-                    else
-                        native_gu_rows(*nfmt, mjobs_[e].blob, mjobs_[e].nact, mjobs_[e].nt, ff, r0, r1);
-                } else if (q2_native_kernels(nfmt->d_type)) {
-                    // Q2_0 down (most IQ layers): the AVX-512 kernel, ggml-cpu has only a scalar one on x86
-                    const ActQ* a2[MAXT];
-                    for (int t = 0; t < mjobs_[e].nt; ++t) a2[t] = &sb.a2[t];
-                    q2_rows_any(mjobs_[e].blob + nfmt->down_off, nfmt->d_row, (int) (nfmt->n_ff / 64), a2,
-                                mjobs_[e].nt, mjobs_[e].out, r0, r1);
-                } else {
-                    const void* hq[MAXT];
-                    for (int t = 0; t < mjobs_[e].nt; ++t) hq[t] = sb.hq[t];
-                    if (narithmetic_ == NativeArithmetic::WindowInvariant)
-                        native_down_rows_invariant(*nfmt, mjobs_[e].blob, hq, mjobs_[e].nt, mjobs_[e].out, r0, r1);
-                    else
-                        native_down_rows(*nfmt, mjobs_[e].blob, hq, mjobs_[e].nt, mjobs_[e].out, r0, r1);
-                }
+                if (mode_ == 5) native_gu_part(e, r0, r1);
+                else native_down_part(e, r0, r1);
                 g += l1 - l0;
+            }
+        } else if (mode_ == 7) {
+            // a native layer in one batch (run_split_multi_native): the gate/up tasks first, then the down tasks
+            const bool gu = (int) i < gu_tasks_;
+            const int per = gu ? (int) nfmt_->n_ff : (int) nfmt_->n_embd;
+            const int T = gu ? gu_tasks_ : mtasks_ - gu_tasks_, j = gu ? (int) i : (int) i - gu_tasks_;
+            const NativeTask t = native_task(j, T, mnb_, per, even_);
+            for (int64_t left = t.rows, e = t.e, r0 = t.r0; left > 0; ++e, r0 = 0) {
+                const int r1 = (int) std::min<int64_t>(per, r0 + left);
+                if (gu) {
+                    native_gu_part((int) e, (int) r0, r1);
+                    // the thread that adds the expert's last rows saw every other thread's rows (one RMW chain)
+                    if (gu_rows_[(size_t) e].fetch_add(r1 - (int) r0, std::memory_order_acq_rel) + (r1 - (int) r0) == per) {
+                        native_quant_part((int) e);
+                        h_ready_[(size_t) e].store(1, std::memory_order_release);
+                    }
+                } else {
+                    wait_h_ready((int) e);
+                    native_down_part((int) e, (int) r0, r1);
+                }
+                left -= r1 - r0;
             }
         } else {
             // plan v0.3 P6: an equal range of the phase's rows across ALL its experts (a range may span two)
@@ -1283,6 +1311,92 @@ void ExpertPool::drain(int id, ExpertScratch& scratch, uint32_t epoch) {
     }
 }
 
+ExpertPool::NativeTask ExpertPool::native_task(int j, int T, int nb, int per, bool even) {
+    NativeTask t;
+    if (even) {   // an equal share of all the rows, strung end to end across the experts
+        const int64_t R = (int64_t) nb * per, g0 = R * j / T;
+        t.e = (int) (g0 / per);
+        t.r0 = (int) (g0 % per);
+        t.rows = R * (j + 1) / T - g0;
+        return t;
+    }
+    const int e = j % nb, parts = (T - e + nb - 1) / nb, p = j / nb;   // part j / nb of expert j % nb
+    t.e = e;
+    t.r0 = (int) ((int64_t) per * p / parts);
+    t.rows = (int64_t) per * (p + 1) / parts - t.r0;
+    return t;
+}
+
+void ExpertPool::native_gu_part(int e, int r0, int r1) {
+    SplitBufMulti& sb = split_multi_[(size_t) e];
+    const NativeFmt* const nfmt = mjobs_[e].fmt != nullptr ? mjobs_[e].fmt : nfmt_;   // 149-cold: same types and rows
+    if (q2_native_kernels(nfmt->gu_type)) {
+        // a native Q2_0 pack: gate and up rows on the Q2_0 kernels, then SwiGLU
+        thread_local float gbuf[MAXT][FF], ubuf[MAXT][FF];
+        float* gp[MAXT];
+        float* up[MAXT];
+        for (int t = 0; t < mjobs_[e].nt; ++t) { gp[t] = gbuf[t]; up[t] = ubuf[t]; }
+        const int nbk = (int) (nfmt->n_embd / 64);
+        q2_rows_any(mjobs_[e].blob, nfmt->gu_row, nbk, mjobs_[e].act, mjobs_[e].nt, gp, r0, r1);
+        q2_rows_any(mjobs_[e].blob + nfmt->up_off, nfmt->gu_row, nbk, mjobs_[e].act, mjobs_[e].nt, up, r0, r1);
+        for (int t = 0; t < mjobs_[e].nt; ++t)
+            for (int r = r0; r < r1; ++r)
+                sb.ff[t][r] = (gbuf[t][r] / (1.f + std::exp(-gbuf[t][r]))) * ubuf[t][r];
+        return;
+    }
+    float* ff[MAXT];
+    for (int t = 0; t < mjobs_[e].nt; ++t) ff[t] = sb.ff[t];
+    if (narithmetic_ == NativeArithmetic::WindowInvariant)
+        native_gu_rows_invariant(*nfmt, mjobs_[e].blob, mjobs_[e].nact, mjobs_[e].nt, ff, r0, r1);
+    else
+        native_gu_rows(*nfmt, mjobs_[e].blob, mjobs_[e].nact, mjobs_[e].nt, ff, r0, r1);
+}
+
+void ExpertPool::native_down_part(int e, int r0, int r1) {
+    SplitBufMulti& sb = split_multi_[(size_t) e];
+    const NativeFmt* const nfmt = mjobs_[e].fmt != nullptr ? mjobs_[e].fmt : nfmt_;
+    if (q2_native_kernels(nfmt->d_type)) {
+        // Q2_0 down (most IQ layers): the AVX-512 kernel, ggml-cpu has only a scalar one on x86
+        const ActQ* a2[MAXT];
+        for (int t = 0; t < mjobs_[e].nt; ++t) a2[t] = &sb.a2[t];
+        q2_rows_any(mjobs_[e].blob + nfmt->down_off, nfmt->d_row, (int) (nfmt->n_ff / 64), a2, mjobs_[e].nt,
+                    mjobs_[e].out, r0, r1);
+        return;
+    }
+    const void* hq[MAXT];
+    for (int t = 0; t < mjobs_[e].nt; ++t) hq[t] = sb.hq[t];
+    if (narithmetic_ == NativeArithmetic::WindowInvariant)
+        native_down_rows_invariant(*nfmt, mjobs_[e].blob, hq, mjobs_[e].nt, mjobs_[e].out, r0, r1);
+    else
+        native_down_rows(*nfmt, mjobs_[e].blob, hq, mjobs_[e].nt, mjobs_[e].out, r0, r1);
+}
+
+void ExpertPool::wait_h_ready(int e) const {
+    uint32_t spins = 0;
+    std::chrono::steady_clock::time_point t0{};
+    while (h_ready_[(size_t) e].load(std::memory_order_acquire) == 0) {
+        strata_cpu_pause();
+        if ((++spins & 1023u) != 0) continue;
+        const auto now = std::chrono::steady_clock::now();
+        if (spins == 1024u) t0 = now;
+        else if (now - t0 > kStall) {
+            std::fprintf(stderr, "strata: the CPU expert pool stalled: a down task waited for expert %d's gate/up rows "
+                                 "(%d done) - stopping the engine so the server can start it again (issue #29)\n",
+                         e, (int) gu_rows_[(size_t) e].load());
+            strata::core::release_gpu_waits(stderr);
+            std::fflush(stderr);
+            std::abort();
+        }
+    }
+}
+
+void ExpertPool::native_quant_part(int e) {
+    SplitBufMulti& sb = split_multi_[(size_t) e];
+    for (int t = 0; t < mjobs_[e].nt; ++t)
+        if (q2_native_kernels(nfmt_->d_type)) act_quant_any(sb.ff[t], FF, sb.a2[t]);
+        else native_quant_h(*nfmt_, sb.ff[t], sb.hq[t]);
+}
+
 void ExpertPool::run_phase(int mode, int n_tasks) {
     wait_parked("before a phase");
     mode_ = mode;
@@ -1308,7 +1422,7 @@ void ExpertPool::run_split(ExpertJob* jobs, int n) {
     if (n > kMaxSplit || n_ == 1 || expert_oracle_q8_0_enabled()) { run(jobs, n); return; }
     const auto t0 = std::chrono::steady_clock::now();
     jobs_ = jobs;
-    const int threads = n_ + (host_works_ ? 1 : 0);
+    const int threads = active_.load(std::memory_order_relaxed) + (host_works_ ? 1 : 0);
     // about three tasks per thread in each phase, so the tail is short
     parts_a_ = (std::max)(1, (3 * threads + n - 1) / n);
     parts_b_ = parts_a_;
@@ -1320,7 +1434,7 @@ void ExpertPool::run_split(ExpertJob* jobs, int n) {
 }
 
 int ExpertPool::phase_tasks(int64_t rows) const {
-    return tasks_ == 0 ? 3 * (n_ + (host_works_ ? 1 : 0)) : (int) (std::min)(rows, (int64_t) tasks_);
+    return tasks_ == 0 ? 3 * (active_.load(std::memory_order_relaxed) + (host_works_ ? 1 : 0)) : (int) (std::min)(rows, (int64_t) tasks_);
 }
 
 void ExpertPool::run_split_multi(ExpertJobMulti* jobs, int n) {
@@ -1372,14 +1486,26 @@ void ExpertPool::run_split_multi_native(const NativeFmt& f, ExpertJobMulti* jobs
         nfmt_ = &f;
         narithmetic_ = arithmetic;
         mrows_ = (int64_t) nb * f.n_ff;
+        if (numa_n_ == 0 && one_batch_) {   // one batch: a down task waits for its own expert's h, not for the whole gate/up phase
+            const auto a = std::chrono::steady_clock::now();
+            for (int e = 0; e < nb; ++e) {
+                gu_rows_[(size_t) e].store(0, std::memory_order_relaxed);
+                h_ready_[(size_t) e].store(0, std::memory_order_relaxed);
+            }
+            mnb_ = nb;
+            // one task per thread and phase, each one long stretch of rows (interleaved parts need one per expert)
+            const int threads = active_.load(std::memory_order_relaxed) + (host_works_ ? 1 : 0);
+            gu_tasks_ = (std::max)(even_ ? 1 : nb, tasks_ == 0 ? threads : tasks_);
+            mtasks_ = 2 * gu_tasks_;
+            run_phase(7, mtasks_);
+            ms_multi_gu += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - a).count();
+            continue;
+        }
         mtasks_ = numa_n_ > 0 ? numa_plan_phase((int) f.n_ff, nb) : phase_tasks(mrows_);
         const auto a = std::chrono::steady_clock::now();
         run_phase(5, mtasks_);
         const auto b = std::chrono::steady_clock::now();
-        for (int e = 0; e < nb; ++e)
-            for (int t = 0; t < mjobs_[e].nt; ++t)
-                if (q2_native_kernels(f.d_type)) act_quant_any(split_multi_[(size_t) e].ff[t], FF, split_multi_[(size_t) e].a2[t]);
-                else native_quant_h(f, split_multi_[(size_t) e].ff[t], split_multi_[(size_t) e].hq[t]);
+        for (int e = 0; e < nb; ++e) native_quant_part(e);
         const auto c = std::chrono::steady_clock::now();
         mrows_ = (int64_t) nb * f.n_embd;
         mtasks_ = numa_n_ > 0 ? numa_plan_phase((int) f.n_embd, nb) : phase_tasks(mrows_);
