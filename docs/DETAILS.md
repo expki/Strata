@@ -504,7 +504,7 @@ applies at the next start. Network, key, MCP and program keys are not editable t
 | `repeat_stop_tokens` | `256` | A reply that repeats one token this many times in a row ends as `"length"`. `0` turns it off. |
 | `effort_position` | `"start"` | `"end"` puts a `low` or `medium` effort in a short system turn right before the answer, so a request that only changes the effort reuses the conversation cache. How well the model follows a level in that place is not measured. |
 | `anthropic_thinking` | as the template | `"on_request"` renders a `/v1/messages` request that asks for no thinking without thinking, as Anthropic does. Claude Code's short helper calls need it. |
-| `tool_call_recovery` | off | Also reads a declared tool's call written as `<parameter=NAME>`, as JSON inside `<tool_call>`, as a `<function=NAME>` block without `<tool_call>`, or as a second call inside one `<tool_call>`. On 1,462 agent turns 98.3% read as intended with it and 92.9% without. |
+| `tool_call_recovery` | on (since 0.2.8; off in 0.2.7 and before) | Also reads a declared tool's call written as `<parameter=NAME>`, as JSON inside `<tool_call>`, as a `<function=NAME>` block without `<tool_call>`, or as a second call inside one `<tool_call>`. On 1,462 agent turns 98.3% read as intended with it and 92.9% without; the 49 specimens of the test corpus read the same with it on or off. Only a declared tool's call is ever recovered; anything else stays text. `"tool_call_recovery": false` turns it off. |
 | `env_to_user` | off | Moves opencode's `<env>` block (working directory, date) to the first user message so the system turn is the same for every session and the disk prefix cache restores it. |
 | `return_progress` | off | Per request `"return_progress": true` adds llama.cpp's `prompt_progress` (`total`, `cache`, `processed`, `time_ms`) to the stream, one update per `--prefill` chunk. A prompt shorter than one chunk sends nothing. |
 | `prevent_sleep` | off | Windows only: keeps the PC awake while a request runs or waits (`SetThreadExecutionState`). On Linux and macOS one startup line says it does nothing. |
@@ -533,6 +533,16 @@ applies at the next start. Network, key, MCP and program keys are not editable t
   guessed: `bash` is not `shell`, and a reordered name (`server1_label_values` for `label_values_mcp_server1`) is not the declared one.
   A call whose envelope drifted by a token (`<=NAME>`,
   `<function:NAME>` or `<NAME>` instead of `<function=NAME>`) is read as the call when NAME is a declared tool.
+- **What the parser repairs, and what it leaves.** A string argument that quotes a whole tool call, or repeats its own
+  `</parameter><parameter=NAME>`, stays exact (#4078). A call whose `</function>` was left out is read as the call (#4427), in the
+  answer and inside the thinking. An argument the tool declares as an array or an object, or declares nothing for, is read as
+  written when it has a slip in it: a trailing or doubled comma, single quotes or `True`/`False`/`None`, a bare string between two
+  members of an object (`"status": "pending", "in_progress", "pending": false`), brackets left open at the end. The server window
+  says `N tool call argument(s) repaired` and `/metrics/prometheus` counts them in `strata:tool_args_repaired_total`. Text that
+  is not an array or an object, a string cut short and a string-typed parameter are never touched. After the thinking has ended at
+  a closing think tag, a second one at the start of a line in the answer is dropped (the model quoted the tag while thinking, #4077):
+  the call that follows is kept. The reasoning between the two went out as the answer already, because a stream cannot take text
+  back.
 - **A call that came back as text because its name was not declared (#3796).** The text stays exactly as the model wrote it and
   `finish_reason` stays `stop` (or `end_turn` on `/v1/messages`). Next to it the reply carries a list, only when there is something in it:
   `"strata_rejected_tool_calls": [{"name": "bash", "reason": "undeclared"}]` (at the top level of a Chat Completions reply, in
@@ -729,6 +739,15 @@ The RAM figure the floor is checked against is the smallest of `MemAvailable`, t
 the engine (v2 `memory.max` and `memory.high`, v1 `memory.limit_in_bytes`, less clean inactive file cache) and the
 `--memory-limit-mib` cap. The startup line `strata generate: memory guard: limit X GiB (source: flag|cgroup|meminfo) ...` names
 the source. It covers parking and session files only, not the startup sizing of the arena, the resident budget or the Windows commit check.
+
+**When the arena does not fit in the RAM that is free (#4051).** The engine checks the RAM before it reads the experts into the
+arena. A memory limit below the arena (a container) stops the start with the numbers. Less free RAM than the arena (an engine
+that was still exiting, another program) is waited for up to 20 s, and the log says so (`STRATA_ARENA_RAM_WAIT_S` changes the
+seconds, `0` loads at once); if it is still short the load goes on with a warning that says how much, never a refusal. Below half
+of the arena the warning adds that the whole PC can stall in memory reclaim, and that a systemd `MemoryHigh=` below the RAM keeps
+one program from taking all of it. The server, before it starts an engine, ends one that an earlier run left behind and now waits up
+to 120 s for it to be gone (it used to wait 10 s): an engine with tens of GB of pinned memory needs longer to give it back, and the
+next one started beside it ran the PC out of RAM (#4051).
 
 Snapshots hold running state, checkpoints, used K/V pages and draft-layer K/V. They add host RAM, not VRAM. Oldest parked entries
 are evicted first. A new conversation that starts at a checkpoint inside a parked one (sub-agents that share a system prompt)
@@ -1546,7 +1565,7 @@ with `--batch 2` at 262,144 context saw 538 MiB at the free line become 395 MiB 
 | not stated | RTX 5070 Ti Laptop, Swift 1.5 IQ3_XXS, a new opencode session in a second folder | `env_to_user`: first request 14,073 tokens with 13,693 from the cache, 1.1 s, against 14,753 read, 11.9 s |
 | 0.1.40.2 | Tesla P100 | A question after a long document re-reads up to 16K tokens (55 s at 262K) without `strata_prefix` |
 | not stated | Codex CLI 0.160.0, Q2_0, RTX 5070 | First prompt 9,443 tokens in 10 s; later tool-loop turns reused about 96% from the cache and read the new part in 1-2 s. Compaction after an 85,000-token conversation reused 84,895 of 84,997 tokens with `codex_compaction_cache` and 41 of 80,683 without |
-| not stated | Signalnine/q27's drift corpus, 1,462 agent turns (Qwen3.8 under Claude Code) | `tool_call_recovery`: 98.3% read as intended, 92.9% without |
+| not stated | Signalnine/q27's drift corpus, 1,462 agent turns (Qwen3.8 under Claude Code) | `tool_call_recovery`: 98.3% read as intended, 92.9% without (on by default from 0.2.8) |
 | not stated | RTX 3080, RVN IQ3_S config, 8-turn chat replay on a 16K-token system prompt | NaN guard on and off: byte-identical answers in 3 pairs; cost 4.8 us of GPU time a window (7.8 us at most), 0.009% of decode time |
 
 ### Decode parking and prompt threads (test box)

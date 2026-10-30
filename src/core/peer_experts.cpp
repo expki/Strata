@@ -9,6 +9,7 @@
 #include "strata/kernels/iq_kernels.hpp"
 #include "strata/kernels/quantize_act.hpp"
 #include "strata/kernels/s2_expert_grouped.hpp"
+#include "strata/kernels/window_limits.hpp"
 
 #include <algorithm>
 #include <chrono>
@@ -28,7 +29,7 @@ bool peer_portable() { return g_peer_portable; }
 namespace {
 
 constexpr int64_t H = strata::kernels::cpu::H;
-constexpr int64_t CAP = strata::kernels::cpu::MAXT * 10;   // entries per layer: MAXT tokens x top-10
+constexpr int64_t CAP = strata::kernels::kWindowMaxT * 10;   // entries per layer: a window's rows x top-10
 
 using Meta = strata_xtier_meta;         // one block, uploaded with one copy per layer (the AMD tier library takes the same)
 static_assert(STRATA_XTIER_CAP == CAP, "the AMD tier library's plan holds a layer's entries");
