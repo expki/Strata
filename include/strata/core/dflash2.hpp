@@ -44,7 +44,8 @@ public:
     Dflash2Drafter& operator=(const Dflash2Drafter&) = delete;
 
     /// Reads the drafter file (the pack of tools/dflash2_pack.py or the incoai GGUF, see dflash2_file.hpp) to the GPU `device` and allocates the ring and the buffers (about 0.8 GB).
-    bool load(const std::string& pack_path, int device, std::string& err);
+    /// `n_layers` is the target's layer count: every tap must be one the verifier gives (0 checks the sign only).
+    bool load(const std::string& pack_path, int device, std::string& err, int n_layers = 0);
     /// The target's embedding and head (and the draft vocabulary file, "" or missing: the whole head).
     bool bind(const WeightTable& wt, const NativeHead* head, const std::string& vocab_file, std::string& err);
     /// Tests: an embedding callback and a head given as raw rows of `head_type` (a native_mmvq type).

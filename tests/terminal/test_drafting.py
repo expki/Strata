@@ -274,8 +274,39 @@ class WhatTheEngineSaid(unittest.TestCase):
         self.assertEqual(drafting.fallback_note(full), drafting.mtp_line(drafting.DIDNT_FIT))
 
     def test_fallback_note_reads_new_refusal(self):
-        self.assertEqual(drafting.fallback_note("--draft dflash2 is off: it is not built for --batch, a layer split or --pipeline-windows 2"),
+        self.assertEqual(drafting.fallback_note("--draft dflash2 is off: it is not built for --batch, a layer split or --pipeline-windows 2; "
+                                                "the MTP drafts instead"),
                          drafting.mtp_line(drafting.NOT_HERE))
+
+    def test_a_late_failure_is_no_mtp_note(self):
+        # after the expert cache is sized the engine ends with exit 1 and the MTP never runs
+        late = ("strata serve: --draft dflash2: dflash2: the drafter's buffers do not fit in VRAM. It needs about 1.2 GiB of VRAM in all "
+                "(the pack 0.76 GiB, buffers and K/V ring 0.25 GiB, a draft head 0.2 GiB); --vram-reserve-mib 1900 keeps it\n")
+        self.assertEqual(drafting.fallback_note(late), "")
+        self.assertEqual(drafting.fallback_note("strata serve: --draft dflash2: the verifier keeps no taps here.\n"), "")
+        self.assertEqual(drafting.fallback_note("--draft dflash2: out of memory"), "")
+
+    def test_a_bad_drafter_file_is_the_bad_file_reason(self):
+        for err in ("dflash2: the pack's shape is not the Flash-Next drafter this engine was written for",
+                    "dflash2: /opt/models/d.gguf: GGUF: bad n_dims for fc.weight",
+                    "dflash2: /opt/models/d.gguf: GGUF v2, this reader handles v3",
+                    "dflash2: /opt/models/d.gguf: the metadata key dflash.block_count is missing",
+                    "dflash2: /opt/models/d.gguf: dflash.target_layers holds 0, and the embedding (0) has no tap",
+                    "dflash2: /opt/models/d.gguf: the tensor token_embd.weight is not one of the drafter's",
+                    "dflash2: /opt/models/d.gguf: the selector codebooks are missing",
+                    "dflash2: the pack's index is cut short",
+                    "dflash2: the drafter taps layer 60, which this model of 48 layers cannot give"):
+            line = f"strata serve: --draft dflash2 is off: {err}; the MTP drafts instead\n"
+            self.assertEqual(drafting.fallback_note(line), drafting.mtp_line(drafting.NOT_DOWNLOADED), err)
+
+    def test_cannot_open_counts_only_for_the_drafter(self):
+        log = ("strata serve: cannot open /tmp/some-cache-file\n"
+               "strata serve: --draft dflash2 is off: dflash2: the pack does not fit in VRAM (760 MiB); the MTP drafts instead\n")
+        self.assertEqual(drafting.fallback_note(log), drafting.mtp_line(drafting.DIDNT_FIT))
+
+    def test_spec_below_two_is_a_refused_mode(self):
+        line = "strata serve: --draft dflash2 is off: it needs --spec 2 or more; the MTP drafts instead\n"
+        self.assertEqual(drafting.fallback_note(line), drafting.mtp_line(drafting.NOT_HERE))
 
     def test_the_servers_start_line(self):
         log = "strata serve: DFlash2 drafter on (/p, graphs captured in 3 ms), MTP not loaded\n"
@@ -312,8 +343,9 @@ class WordsMatchTheApp(unittest.TestCase):
             for lang, catalog in catalogs.items():
                 self.assertTrue(catalog[ids[line]].strip(), f"{line} in {lang}")
         # and what the engine's log makes of them
-        self.assertEqual(drafting.fallback_note("--draft dflash2: out of memory"), drafting.mtp_line(drafting.DIDNT_FIT))
-        self.assertEqual(drafting.fallback_note("--draft dflash2 is off: it is for one card and the CLI run"), drafting.mtp_line(drafting.NOT_HERE))
+        self.assertEqual(drafting.fallback_note("--draft dflash2: out of memory. The MTP drafts instead."), drafting.mtp_line(drafting.DIDNT_FIT))
+        self.assertEqual(drafting.fallback_note("--draft dflash2 is off: it is for one card and the CLI run; the MTP drafts instead"),
+                         drafting.mtp_line(drafting.NOT_HERE))
 
 
 class TerminalFlag(unittest.TestCase):

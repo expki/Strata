@@ -31,6 +31,9 @@ public:
 /// The pack name of a GGUF tensor of the incoai drafter, or "" when the name is not one.
 std::string dflash2_pack_name(const std::string& gguf_name);
 
+/// True when `taps` is not empty and every tap is a layer in [0, n_layers - 1), the layers the verifier taps.  `n_layers` 0 checks the sign only.
+bool dflash2_check_taps(const std::vector<int>& taps, int n_layers, std::string& err);
+
 /// `n_values` (a multiple of 32) values of ggml Q8_0 blocks as bf16, rounded to nearest even.
 void dflash2_q8_0_to_bf16(const uint8_t* blocks, int64_t n_values, uint16_t* out);
 

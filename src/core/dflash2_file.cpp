@@ -7,6 +7,7 @@
 #include <cstdio>
 #include <cstring>
 #include <exception>
+#include <stdexcept>
 
 namespace strata::core {
 namespace {
@@ -115,13 +116,17 @@ private:
         const MetaValue& taps = meta("dflash.target_layers");
         if (taps.type != MetaType::ARRAY || taps.items.empty()) throw std::runtime_error("dflash.target_layers is not an array");
         std::string list;
-        for (const MetaValue& v : taps.items) list += (list.empty() ? "" : ",") + std::to_string((long long) v.num() - 1);   // the GGUF counts the embedding as 0
+        for (const MetaValue& v : taps.items) {
+            if (v.num() < 1) throw std::runtime_error("dflash.target_layers holds " + num_str(v.num()) + ", and the embedding (0) has no tap");
+            list += (list.empty() ? "" : ",") + std::to_string((long long) v.num() - 1);   // the GGUF counts the embedding as 0
+        }
         cfg_["taps"] = list;
 
         uint64_t off = 0;
         for (const TensorInfo& g : gguf_->tensors()) {
             const std::string name = dflash2_pack_name(g.name);
             if (name.empty()) throw std::runtime_error("the tensor " + g.name + " is not one of the drafter's");
+            if (g.shape.empty()) throw std::runtime_error("the tensor " + g.name + " has no dimensions");
             Dflash2Tensor t;
             t.name = name;
             t.cols = (int64_t) g.shape[0];
@@ -231,6 +236,17 @@ std::string dflash2_pack_name(const std::string& n) {
         if (n[i] < '0' || n[i] > '9') return "";
     const auto it = part.find(n.substr(dot + 1));
     return it == part.end() ? "" : "layers." + n.substr(4, dot - 4) + "." + it->second;
+}
+
+bool dflash2_check_taps(const std::vector<int>& taps, int n_layers, std::string& err) {
+    if (taps.empty()) { err = "dflash2: the drafter names no target layers to tap"; return false; }
+    for (int t : taps)
+        if (t < 0 || (n_layers > 0 && t >= n_layers - 1)) {
+            err = "dflash2: the drafter taps layer " + std::to_string(t) +
+                  (n_layers > 0 ? ", which this model of " + std::to_string(n_layers) + " layers cannot give" : std::string(", which is not a layer"));
+            return false;
+        }
+    return true;
 }
 
 void dflash2_q8_0_to_bf16(const uint8_t* blocks, int64_t n_values, uint16_t* out) {

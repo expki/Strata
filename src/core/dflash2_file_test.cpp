@@ -29,7 +29,7 @@ static void kv_f32(std::vector<uint8_t>& b, const std::string& k, float v) { put
 struct FakeTensor { std::string name; std::vector<uint64_t> shape; uint32_t type; std::vector<uint8_t> data; };
 
 // A GGUF v3 with the dflash.* keys and the given tensors, data 32-byte aligned.
-static std::filesystem::path write_gguf(const std::vector<FakeTensor>& ts) {
+static std::filesystem::path write_gguf(const std::vector<FakeTensor>& ts, uint32_t tap0 = 6, uint32_t tap1 = 16) {
     std::vector<uint8_t> b;
     put<uint32_t>(b, 0x46554747u);
     put<uint32_t>(b, 3);
@@ -51,7 +51,7 @@ static std::filesystem::path write_gguf(const std::vector<FakeTensor>& ts) {
     kv_u32(b, "dflash.attention.sliding_window", 2048);
     kv_u32(b, "tokenizer.ggml.mask_token_id", 248077);
     put_str(b, "dflash.target_layers");   // an array of 2 u32
-    put<uint32_t>(b, 9); put<uint32_t>(b, 4); put<uint64_t>(b, 2); put<uint32_t>(b, 6); put<uint32_t>(b, 16);
+    put<uint32_t>(b, 9); put<uint32_t>(b, 4); put<uint64_t>(b, 2); put<uint32_t>(b, tap0); put<uint32_t>(b, tap1);
     put_str(b, "general.alignment"); put<uint32_t>(b, 4); put<uint32_t>(b, 32);
     uint64_t off = 0;
     for (const FakeTensor& t : ts) {
@@ -153,6 +153,32 @@ int main() {
         const auto bad = write_gguf({FakeTensor{"token_embd.weight", {64}, 0, std::vector<uint8_t>(256, 0)}});
         err.clear();
         CHECK(Dflash2Source::open(bad.string(), err) == nullptr && err.find("token_embd.weight") != std::string::npos);
+    }
+    {
+        // a target layer of 0 is the embedding, which has no tap
+        std::string err;
+        const auto p0 = write_gguf({fc, norm, conv, cb}, 0, 16);
+        CHECK(Dflash2Source::open(p0.string(), err) == nullptr && err.find("target_layers") != std::string::npos);
+    }
+    {
+        // a tensor with no dimensions is refused before its shape is read
+        std::string err;
+        const auto p0 = write_gguf({FakeTensor{"fc.weight", {}, 0, std::vector<uint8_t>(32, 0)}, cb});
+        CHECK(Dflash2Source::open(p0.string(), err) == nullptr && err.find("fc.weight") != std::string::npos);
+    }
+    {
+        // every tap must be a layer the verifier can tap, which is all but the last
+        std::string err;
+        CHECK(dflash2_check_taps({5, 15, 25}, 48, err) && err.empty());
+        CHECK(dflash2_check_taps({0, 46}, 48, err));
+        CHECK(!dflash2_check_taps({-1, 15}, 48, err) && err.find("-1") != std::string::npos);
+        err.clear();
+        CHECK(!dflash2_check_taps({5, 47}, 48, err) && err.find("47") != std::string::npos);
+        err.clear();
+        CHECK(!dflash2_check_taps({}, 48, err) && !err.empty());
+        err.clear();
+        CHECK(dflash2_check_taps({5, 4000}, 0, err));   // no model yet: only the sign is checked
+        CHECK(!dflash2_check_taps({-2}, 0, err));
     }
     std::filesystem::remove(path);
     if (fails == 0) std::printf("dflash2_file_test: ok\n");

@@ -230,11 +230,14 @@ public:
     /// DFlash2 prompt taps (CUDA / HIP, single stage): before `run`, ask for the completed output of each layer in `layers` (zero-based; the
     /// mean of the hc streams) for the prompt rows at positions >= `first_pos`, at most `cap_rows` rows per chunk (a staging buffer of
     /// cap_rows x layers x n_embd floats is allocated at the first chunk).  After each chunk that has such rows, on_taps(taps
-    /// [rows][layers][n_embd] device, rows, first position, err) runs with the stream synchronized.  clear_taps frees the staging.
+    /// [rows][layers][n_embd] device, rows, first position, err) runs with the stream synchronized.  clear_taps frees the staging
+    /// unless hold_taps allocated it.
     void set_taps(const std::vector<int>& layers, int64_t first_pos, int64_t cap_rows) { tap_layers_ = layers; tap_first_ = first_pos; tap_cap_ = cap_rows; tap_per_chunk_ = 0; }
     /// The server's form of set_taps: every chunk taps its last `per_chunk` rows (2047), so the drafter holds the window ending at each chunk end.
     void set_chunk_taps(const std::vector<int>& layers, int64_t per_chunk) { tap_layers_ = layers; tap_first_ = -1; tap_cap_ = per_chunk; tap_per_chunk_ = per_chunk; }
     void clear_taps();
+    /// The server: allocate the staging for `rows` x `layers` x `n_embd` floats now and keep it for the life of this object.
+    bool hold_taps(int64_t rows, size_t layers, int64_t n_embd, std::string& err);
     std::function<bool(const float* taps, int64_t rows, int64_t pos0, std::string& err)> on_taps;
 
     /// Layer split: called by every stage when it has read a chunk, with the position reached, while its own state
@@ -332,6 +335,8 @@ private:
     std::vector<int> tap_layers_;
     int64_t tap_first_ = 0, tap_cap_ = 0, tap_per_chunk_ = 0;   // tap_per_chunk_ > 0: the last rows of every chunk
     float* tap_dev_ = nullptr;
+    size_t tap_bytes_ = 0;    // the staging's size
+    bool tap_held_ = false;   // hold_taps: clear_taps keeps the staging
     Prefill* next_ = nullptr;
     Prefill* helper_ = nullptr;         ///< set_stage_helper
     bool single_chunk_ = false;         ///< a later stage: the prompt is one chunk (set by the stage before)

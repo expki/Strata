@@ -687,6 +687,13 @@ int main() {
         SessionSaveLive huge = live;
         huge.state_bytes = UINT64_MAX;
         check(session_save_peak_bytes(&chain[1], huge) == UINT64_MAX, "save: the peak saturates");
+        {   // the file's second DFlash2 window (the deepest checkpoint's) is in that checkpoint's bytes, in both copies
+            ConversationCheckpoint with_window = chain[1];
+            const uint64_t bare = session_save_peak_bytes(&with_window, live);
+            with_window.drafter.assign(1u << 20, 0x5a);
+            check(session_save_peak_bytes(&with_window, live) - bare == 2 * (uint64_t) with_window.drafter.capacity(),
+                  "save: the deepest checkpoint's window counts twice");
+        }
         std::vector<ConversationCheckpoint> out(1);
         std::string why;
         uint64_t asked = 0;

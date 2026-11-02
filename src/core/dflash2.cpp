@@ -119,7 +119,7 @@ const Dflash2Drafter::Tensor& Dflash2Drafter::find(const std::string& name) cons
     throw std::runtime_error("dflash2: tensor " + name + " is missing from the pack");
 }
 
-bool Dflash2Drafter::load(const std::string& path, int device, std::string& err) {
+bool Dflash2Drafter::load(const std::string& path, int device, std::string& err, int n_layers) {
     device_ = device;
     const OnDevice on_device(device_);
     const std::unique_ptr<Dflash2Source> src = Dflash2Source::open(path, err);
@@ -144,6 +144,7 @@ bool Dflash2Drafter::load(const std::string& path, int device, std::string& err)
             for (; *c;) { taps_.push_back(std::atoi(c)); while (*c && *c != ',') ++c; if (*c == ',') ++c; }
         }
     }
+    if (!dflash2_check_taps(taps_, n_layers, err)) return false;
     tensors_ = src->tensors();
     uint64_t total = 0;
     for (const Tensor& t : tensors_) total = std::max(total, t.off + t.bytes);
@@ -245,12 +246,12 @@ bool Dflash2Drafter::bind_raw(EmbedFn embed, const void* head_w, int head_type, 
     n_dvocab_ = head_rows;
     if (!vocab.empty()) {
         n_dvocab_ = (int64_t) vocab.size();
-        if (cudaMalloc((void**) &dvocab_, vocab.size() * 4) != cudaSuccess) { err = "dflash2: draft vocabulary"; return false; }
+        if (cudaMalloc((void**) &dvocab_, vocab.size() * 4) != cudaSuccess) { err = "dflash2: the draft vocabulary does not fit in VRAM"; return false; }
         vram_ += vocab.size() * 4;
         cudaMemcpy(dvocab_, vocab.data(), vocab.size() * 4, cudaMemcpyHostToDevice);
     }
     if ((n_dvocab_ + kernels::kDf2TopBlocks - 1) / kernels::kDf2TopBlocks > 4096) { err = "dflash2: the head has too many rows for the top-k"; return false; }
-    if (!logits_ && cudaMalloc((void**) &logits_, (size_t) kDrafts * (size_t) n_dvocab_ * 4) != cudaSuccess) { err = "dflash2: the draft logits do not fit"; return false; }
+    if (!logits_ && cudaMalloc((void**) &logits_, (size_t) kDrafts * (size_t) n_dvocab_ * 4) != cudaSuccess) { err = "dflash2: the draft logits do not fit in VRAM"; return false; }
     vram_ += (uint64_t) kDrafts * (uint64_t) n_dvocab_ * 4;
     bound_ = true;
     return true;
@@ -292,7 +293,7 @@ bool Dflash2Drafter::bind(const WeightTable& wt, const NativeHead* head, const s
         int32_t* dv = nullptr;
         if (cudaMalloc((void**) &dv, vocab.size() * 4) != cudaSuccess || cudaMalloc((void**) &dhead_, (size_t) ((int64_t) vocab.size() * row_bytes)) != cudaSuccess) {
             if (dv) cudaFree(dv);
-            err = "dflash2: the draft vocabulary's head rows do not fit";
+            err = "dflash2: the draft vocabulary's head rows do not fit in VRAM";
             return false;
         }
         cudaMemcpy(dv, vocab.data(), vocab.size() * 4, cudaMemcpyHostToDevice);

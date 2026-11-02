@@ -6345,8 +6345,8 @@ int main(int argc, char** argv) {
     // --serve --draft dflash2 loads DFlash2 before MTP, and on success MTP is never loaded
     if (o.serve && o.draft == "dflash2") {
         const char* why = multi_gpu || o.batch > 0 || o.pipeline_windows >= 2 ? "it is not built for --batch, a layer split or --pipeline-windows 2"
-                          : !native_pack ? "it needs a native pack" : nullptr;
-        if (why == nullptr && df2.load(o.draft_model, 0, err)) {
+                          : !native_pack ? "it needs a native pack" : o.spec < 2 ? "it needs --spec 2 or more" : nullptr;
+        if (why == nullptr && df2.load(o.draft_model, 0, err, (int) g.n_layers)) {
             use_df2 = true;
             df2_vocab = !o.mtp_draft_vocab.empty() ? o.mtp_draft_vocab : o.mtp.empty() ? std::string() : o.mtp + "/draft_vocab.bin";
             cudaDeviceProp dp{};
@@ -6388,7 +6388,7 @@ int main(int argc, char** argv) {
                               : multi_gpu || o.batch > 0 ? "it is not built for --batch, a layer split or --pipeline-windows 2"
                               : o.draft_model.empty() ? "it needs --draft-model PACK (tools/dflash2_pack.py)" : nullptr;
             if (why == nullptr) {
-                if (df2.load(o.draft_model, 0, err)) {
+                if (df2.load(o.draft_model, 0, err, (int) g.n_layers)) {
                     use_df2 = true;
                     // Per card class, from the measured A/Bs (notes-dflash2-p1.md): on Strix Halo a window of 5 is the agent-safe pick (cap 6 ties on
                     // agent prompts); a 12 GB NVIDIA card is slower with DFlash2 than with the MTP at every cap but code, which only the user can know.
@@ -6458,13 +6458,14 @@ int main(int argc, char** argv) {
     strata::core::NativeHead native_head;
 #if defined(STRATA_HAVE_DFLASH2)
     // DFlash2's VRAM taken after the expert cache is sized: its draft head and logits, under --serve also the prompt tap staging
+    constexpr int64_t kDf2TapRows = 2048;   // the held prompt tap staging's rows, the largest any tap request asks for
     auto df2_bind_bytes = [&]() -> int64_t {
         if (!o.serve) return (int64_t) mtp.bind_bytes(native_head.row_bytes(), n_vocab) + (48 << 20);
         int64_t b = 48 << 20;
         std::error_code ec;
         const uintmax_t sz = df2_vocab.empty() ? 0 : std::filesystem::file_size(df2_vocab, ec);
         if (!ec && sz >= 4) b += (int64_t) (sz / 4) * (int64_t) native_head.row_bytes() + (int64_t) sz;
-        return b + 2047 * (int64_t) df2.tap_layers().size() * df2.n_embd() * 4;
+        return b + kDf2TapRows * (int64_t) df2.tap_layers().size() * df2.n_embd() * 4;
     };
 #endif
     if (!o.native_head_gguf.empty() && !multi_gpu) {   // a layer split's head is on its last stage
@@ -10517,15 +10518,20 @@ int main(int argc, char** argv) {
 #if defined(STRATA_HAVE_DFLASH2)
         if (use_df2) {   // the expert cache is sized, so MTP cannot stand in any more
             if (!ver.tapping()) err = "the verifier keeps no taps here";
-            if (!ver.tapping() || !df2.bind(wt, &native_head, df2_vocab, err) || !df2.prepare(ver.tap_dev(), err)) {
-                std::fprintf(stderr, "strata serve: --draft dflash2: %s. It needs about 1.2 GiB of VRAM in all (the pack 0.76 GiB, buffers and K/V "
-                                     "ring 0.25 GiB, a draft head 0.2 GiB); --vram-reserve-mib 1900 keeps it (the expert cache gives up about "
-                                     "2.5%% of its experts to the CPU)\n", err.c_str());
+            // the prompt tap staging is held from here on, so nothing allocated later can take it between reads
+            if (!ver.tapping() || !df2.bind(wt, &native_head, df2_vocab, err) || !df2.prepare(ver.tap_dev(), err) ||
+                !sp.hold_taps(kDf2TapRows, df2.tap_layers().size(), df2.n_embd(), err)) {
+                // the VRAM hint only when VRAM was the cause
+                const bool vram = err.find("VRAM") != std::string::npos || err.find("out of memory") != std::string::npos;
+                std::fprintf(stderr, "strata serve: --draft dflash2: %s.%s\n", err.c_str(),
+                             vram ? " It needs about 1.2 GiB of VRAM in all (the pack 0.76 GiB, buffers and K/V ring 0.25 GiB, a draft head "
+                                    "0.2 GiB); --vram-reserve-mib 1900 keeps it (the expert cache gives up about 2.5% of its experts to the CPU)"
+                                  : "");
                 return 1;
             }
             serve_drafter = strata::program::make_dflash2_serve_drafter(df2, ver, df2_cap);
-            std::fprintf(stderr, "strata serve: DFlash2 drafter on (%s, graphs captured in %.0f ms), MTP not loaded\n", o.draft_model.c_str(),
-                         df2.ms_capture);
+            std::fprintf(stderr, "strata serve: DFlash2 drafter on (%s, graphs captured in %.0f ms, prompt tap staging %.0f MiB held), MTP not loaded\n",
+                         o.draft_model.c_str(), df2.ms_capture, (double) kDf2TapRows * (double) df2.tap_layers().size() * (double) df2.n_embd() * 4 / 1048576.0);
         }
 #endif
         // the MTP's draft K/V for the conversation snapshots, null without the MTP
@@ -15037,7 +15043,8 @@ int main(int argc, char** argv) {
             // host copies and slots are always current (every writer writes both), so they need nothing
             const int64_t read_from = reread_to > 0 ? 0 : resume;
             // the live session goes on: the ring holds its rows when the last request ended where this one resumes
-            if (df2_windows && !df2_done && read_from > 0 && serve_drafter->window_end() != read_from)
+            // STRATA_CKPT_REREAD reads from 0, so its taps rebuild the window and nothing is logged
+            if (df2_windows && !df2_done && reread_to < 0 && read_from > 0 && serve_drafter->window_end() != read_from)
                 df2_restore(nullptr, read_from, "live");
             if (serve_drafter && !serve_drafter->begin_request(read_from, n, err)) {
                 std::printf("ERR %s\n", err.c_str());

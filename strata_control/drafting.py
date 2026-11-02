@@ -252,24 +252,30 @@ _ON = re.compile(r"DFlash2 drafter on\b")
 
 
 #: the engine's words for a mode it does not run DFlash2 in (the serve refusal, and the older CLI only line)
-_NOT_HERE_WORDS = ("it is not built for", "it is for one card and the cli run", "needs a native pack", "it needs --mtp")
-#: the engine's words for a drafter file it could not open or read
-_NO_FILE_WORDS = ("cannot open", "is not a df2p", "is neither a df2p pack nor a gguf")
+_NOT_HERE_WORDS = ("it is not built for", "it is for one card and the cli run", "needs a native pack", "it needs --mtp", "it needs --spec")
+#: the engine's words for a drafter file it could not open or read, or one that is not the drafter it was written for
+_NO_FILE_WORDS = ("dflash2: cannot open", "is not a df2p", "is neither a df2p pack nor a gguf", "the pack's shape is not",
+                  "the pack's index", "the pack is shorter", ": gguf", "the metadata key", "target_layers", "the tensor ",
+                  "the selector codebooks", "the drafter taps layer", "names no target layers")
+#: the line the engine prints when the MTP stands in; without it the start failed and nothing drafts
+_MTP_INSTEAD = "the mtp drafts instead"
 
 
 def fallback_note(log_text: str) -> str:
-    """From one engine start's log: ``Drafting: MTP (<reason>)`` when the engine fell back from DFlash2, else ``""``. The engine names the
-    reason in its own words; three are told apart: a mode it does not run DFlash2 in, a drafter file it cannot open or read, and (any other
-    failure) no room in graphics memory."""
+    """From one engine start's log: ``Drafting: MTP (<reason>)`` when the engine fell back from DFlash2, else ``""``. Only a line that
+    says the MTP drafts instead counts, since a failure after the expert cache is sized ends the start and the MTP never runs. Three
+    reasons are told apart: a mode it does not run DFlash2 in, a drafter file it cannot open or read, and (any other failure) no room in
+    graphics memory."""
     text = str(log_text or "")
     if _ON.search(text):
         return ""
-    if "--draft dflash2" not in text:
+    lines = [line for line in text.lower().splitlines() if "--draft dflash2" in line and _MTP_INSTEAD in line]
+    if not lines:
         return ""
-    low = text.lower()
-    if any(words in low for words in _NOT_HERE_WORDS):
+    said = "\n".join(lines)
+    if any(words in said for words in _NOT_HERE_WORDS):
         reason = NOT_HERE
-    elif any(words in low for words in _NO_FILE_WORDS):
+    elif any(words in said for words in _NO_FILE_WORDS):
         reason = NOT_DOWNLOADED
     else:
         reason = DIDNT_FIT

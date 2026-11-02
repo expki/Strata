@@ -1328,18 +1328,37 @@ strata::kernels::QsaAttnPools pools_of(const strata::kernels::KvHostPools& h, co
 
 Prefill::Prefill() : impl_(new Impl) {}
 Prefill::~Prefill() {
+    tap_held_ = false;
     clear_taps();
     release();
 }
 
 void Prefill::clear_taps() {
-    if (tap_dev_ != nullptr) {
+    if (tap_dev_ != nullptr && !tap_held_) {
         cudaFree(tap_dev_);
         tap_dev_ = nullptr;
+        tap_bytes_ = 0;
     }
     tap_layers_.clear();
     tap_per_chunk_ = 0;
     on_taps = nullptr;
+}
+
+bool Prefill::hold_taps(int64_t rows, size_t layers, int64_t n_embd, std::string& err) {
+    const size_t bytes = (size_t) rows * layers * (size_t) n_embd * 4;
+    if (tap_dev_ != nullptr && tap_bytes_ >= bytes) { tap_held_ = true; return true; }
+    if (tap_dev_ != nullptr) cudaFree(tap_dev_);
+    tap_dev_ = nullptr;
+    tap_bytes_ = 0;
+    if (cudaMalloc((void**) &tap_dev_, bytes) != cudaSuccess) {
+        (void) cudaGetLastError();
+        tap_dev_ = nullptr;
+        err = "prefill: the DFlash2 tap staging does not fit in VRAM";
+        return false;
+    }
+    tap_bytes_ = bytes;
+    tap_held_ = true;
+    return true;
 }
 
 void Prefill::reset() {
@@ -3996,12 +4015,21 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
 #if defined(STRATA_HAVE_DFLASH2)
     std::vector<int> tap_slot;
     if (!tap_layers_.empty() && stage_lb_ == 0 && (stage_le_ < 0 || stage_le_ == g.n_layers)) {
-        if (tap_dev_ == nullptr &&
-            cudaMalloc((void**) &tap_dev_, (size_t) tap_cap_ * tap_layers_.size() * (size_t) g.n_embd * 4) != cudaSuccess) {
-            (void) cudaGetLastError();
+        const size_t tap_need = (size_t) tap_cap_ * tap_layers_.size() * (size_t) g.n_embd * 4;
+        if (tap_dev_ != nullptr && tap_bytes_ < tap_need) {
+            if (tap_held_) { err = "prefill: the held DFlash2 tap staging is smaller than the taps asked for"; return false; }
+            cudaFree(tap_dev_);
             tap_dev_ = nullptr;
-            err = "prefill: the DFlash2 tap staging does not fit in VRAM";
-            return false;
+            tap_bytes_ = 0;
+        }
+        if (tap_dev_ == nullptr) {
+            if (cudaMalloc((void**) &tap_dev_, tap_need) != cudaSuccess) {
+                (void) cudaGetLastError();
+                tap_dev_ = nullptr;
+                err = "prefill: the DFlash2 tap staging does not fit in VRAM";
+                return false;
+            }
+            tap_bytes_ = tap_need;
         }
         tap_slot.assign((size_t) g.n_layers, -1);
         for (size_t i = 0; i < tap_layers_.size(); ++i) tap_slot[(size_t) tap_layers_[i]] = (int) i;
