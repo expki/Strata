@@ -6,6 +6,7 @@
 // max|row| / 254 + one bf16 ulp (the GGUF holds the codebooks as Q8_0).  Prints "OK <n> tensors" or the first mismatch.
 #include "strata/core/dflash2_file.hpp"
 
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -72,7 +73,22 @@ int main(int argc, char** argv) {
             if (std::memcmp(da.data(), db.data(), da.size()) != 0) {
                 size_t i = 0;
                 while (da[i] == db[i]) ++i;
-                return fail("tensor " + g.name + " differs at byte " + std::to_string(i));
+                std::string what = "tensor " + g.name + " differs at byte " + std::to_string(i);
+                if (g.dtype == "q8_0") {
+                    int64_t bad_d = 0, bad_q = 0, bad_blocks = 0, maxdq = 0;
+                    for (size_t k = 0; k < da.size() / 34; ++k) {
+                        const uint8_t* x = da.data() + k * 34;
+                        const uint8_t* y = db.data() + k * 34;
+                        if (std::memcmp(x, y, 34) == 0) continue;
+                        ++bad_blocks;
+                        if (x[0] != y[0] || x[1] != y[1]) ++bad_d;
+                        for (int j = 2; j < 34; ++j)
+                            if (x[j] != y[j]) { ++bad_q; maxdq = std::max<int64_t>(maxdq, std::llabs((int64_t) (int8_t) x[j] - (int64_t) (int8_t) y[j])); }
+                    }
+                    what += " (" + std::to_string(bad_blocks) + " of " + std::to_string(da.size() / 34) + " blocks differ, " + std::to_string(bad_d) + " scales, " +
+                            std::to_string(bad_q) + " quants, largest step " + std::to_string(maxdq) + ")";
+                }
+                return fail(what);
             }
         } else {
             const uint16_t* x = reinterpret_cast<const uint16_t*>(da.data());
