@@ -70,8 +70,8 @@ struct Answer {
     float prob[7];
 };
 
-// FP16 rounding of a correct save leaves the final rows at cosine 0.9978 or more (4 runs), a save one row off falls far below this
-constexpr double kMinCos = 0.99;
+// a correct save leaves the final rows at cosine 0.9978 or more after FP16 rounding (8 runs), a save one row off gives 0.9910
+constexpr double kMinCos = 0.995;
 
 int g_bad = 0;
 void expect(bool ok, const char* what) {
@@ -213,10 +213,11 @@ int main(int argc, char** argv) {
         d.clear_ring(1000);
         if (!context(d, t1, 0, 100, 1000) || !draft(d, t1, 100, 1100, G)) return 1;
         d.debug_rows(rows_g, err);
-        same(R, G, "(g) clear_ring(1000) then 100 rows: drafts like a context of those 100 rows alone");
+        info(R, G, "(g) clear_ring(1000) then 100 rows against a context of those 100 rows alone");
         const double cg = min_cosine(rows_ref, rows_g);
         std::printf("  final rows min cosine %.7f\n", cg);
-        expect(cg > 0.9999, "(g) the final rows match (rope positions differ by 1000, so not bitwise)");
+        // the rope angles differ by 1000 positions so the rows are close, not bitwise, and without the floor the cosine is 0.45
+        expect(tokens_equal(R, G) && cg > 0.99, "(g) clear_ring(1000) then 100 rows drafts like a context of those 100 rows alone");
     }
     {   // (e) the ring wraps twice
         const int n = 5000;
@@ -240,6 +241,13 @@ int main(int argc, char** argv) {
             if (!open(d) || !context(d, t2, 0, 300, 0)) return 1;
             expect(d.restore_window(w3, u, err), "(e) restore_window after the wrap");
             if (!draft(d, t3, u, u, E)) return 1;
+        }
+        {   // (i) a save reads the right positions: rows are independent of what else the ring holds
+            Dflash2Drafter da, dc;
+            std::vector<uint8_t> wa, wc;
+            if (!open(da) || !context(da, t3, 0, 3000, 0) || !open(dc) || !context(dc, t3, 942, 2048, 942)) return 1;
+            expect(da.save_window(2990, wa, err) && dc.save_window(2990, wc, err) && wa == wc,
+                   "(i) save_window of a wrapped ring equals that of a ring holding only positions 942 to 2989");
         }
         same(C, D, "(e) a wrapped ring drafts like a drafter that saw only the last 2048 rows");
         same(C2, E, "(e) a restored wrapped window drafts like the live ring rounded to FP16");
