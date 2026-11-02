@@ -1,11 +1,4 @@
-// src/core/dflash2_window_test.cpp - the DFlash2 drafter's window save and restore (GPU, no model).
-//
-//     dflash2_window_test <pack-or-gguf>
-//
-// Seeded random taps, head rows and embedding stand in for the target (no torch, no case file).  Checks: a restored window drafts like the
-// live ring rounded to FP16 by a restore in place (a), (b), a window of another position is refused (c), its size (d), a ring that wrapped
-// holds the last 2048 rows (e), the time of 2047 context rows (f) and that clear_ring leaves no stale row (g).  The FP32 live ring is only
-// compared as information, because the window is FP16.
+// src/core/dflash2_window_test.cpp - the DFlash2 drafter window save and restore on seeded random taps (GPU, usage: dflash2_window_test <pack-or-gguf>).
 #include "strata/core/dflash2.hpp"
 
 #include <cuda_runtime.h>
