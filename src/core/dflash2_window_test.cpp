@@ -141,7 +141,7 @@ int main(int argc, char** argv) {
     const int n_ctx = 2300;
     const int64_t up = n_ctx - 1;
     Dev t1(randn((size_t) n_ctx * TAPN, 1, 1.0f)), t2(randn((size_t) 300 * TAPN, 2, 1.0f));
-    Answer A{}, B{};
+    Answer A{}, A2{}, B{};
     std::vector<uint8_t> w;
     {   // (a) the live ring
         Dflash2Drafter d;
@@ -149,6 +149,8 @@ int main(int argc, char** argv) {
         expect(d.save_window(up, w, err), "(a) save_window");
         if (!draft(d, t1, up, up, A)) return 1;
         for (int i = 0; i < 7; ++i) std::printf("  draft %d: %d (p %.3f)\n", i, A.tok[i], A.prob[i]);
+        // the same ring rounded to FP16 by a restore in place: the exact reference for (b)
+        if (!d.restore_window(w, up, err) || !draft(d, t1, up, up, A2)) { std::fprintf(stderr, "restore in place: %s\n", err.c_str()); return 1; }
     }
     {   // (b) a ring that moved on, then the restore; (c) the refusal; (d) the size
         Dflash2Drafter d;
@@ -158,6 +160,7 @@ int main(int argc, char** argv) {
         expect(d.restore_window(w, up, err), "(b) restore_window");
         if (!draft(d, t1, up, up, B)) return 1;
         same(A, B, "(b) restored drafts equal the live ring's");
+        same(A2, B, "(b) restored drafts equal the live ring rounded to FP16 by a restore in place");
         expect(w.size() == d.window_bytes(up), "(d) w.size() == window_bytes(n_ctx - 1)");
         std::printf("  window %zu bytes for upto %lld, %zu bytes for upto 100\n", w.size(), (long long) up, d.window_bytes(100));
     }
