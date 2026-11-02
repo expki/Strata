@@ -1,7 +1,4 @@
-// include/strata/core/dflash2_file.hpp - the DFlash2 drafter's file on the host: the engine's DF2P pack or the incoai GGUF (Q8_0).
-//
-// Both read as the same thing: the pack's cfg keys, and tensors under the pack's names, dtypes and offsets (a "pack-layout blob").  The
-// GGUF's two codebooks are widened from Q8_0 to bf16 on read, as the pack stores them.  Host only: no CUDA.
+// include/strata/core/dflash2_file.hpp - the DFlash2 drafter's file on the host, a DF2P pack or the incoai GGUF, read as one pack layout (no CUDA).
 #pragma once
 
 #include <cstdint>

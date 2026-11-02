@@ -1,9 +1,4 @@
-// src/core/dflash2_file_compare.cpp - the DF2P pack against the incoai GGUF of the same drafter (host only, no GPU).
-//
-//     dflash2_file_compare <pack> <gguf>
-//
-// Checks the same tensor set (name, dtype, shape), every cfg key, the bytes of each f32 tensor, each q8_0 tensor (same scales, quants at most one step apart), and each bf16 codebook value within
-// max|row| / 254 + one bf16 ulp (the GGUF holds the codebooks as Q8_0).  Prints "OK <n> tensors" or the first mismatch.
+// src/core/dflash2_file_compare.cpp - dflash2_file_compare <pack> <gguf>: the DF2P pack against the incoai GGUF of the same drafter (host only).
 #include "strata/core/dflash2_file.hpp"
 
 #include <algorithm>
