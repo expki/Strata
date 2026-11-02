@@ -59,7 +59,7 @@ public:
     size_t window_bytes(int64_t upto) const;
     /// The FP16 keys and values of positions [max(0, upto - kWindow), upto) in `out`, for restore_window.  False if `upto` is beyond the context held.
     bool save_window(int64_t upto, std::vector<uint8_t>& out, std::string& err);
-    /// Writes a saved window back to the ring and the context ends at `upto`.  False (the ring untouched) if `in` was saved at another `upto` or on another layout.
+    /// Writes a saved window and its floor back so the context ends at `upto`, false with the ring untouched on another `upto` or layout.
     /// A device failure part way leaves the ring partly overwritten, so the caller must clear_ring or restore again.
     bool restore_window(const std::vector<uint8_t>& in, int64_t upto, std::string& err);
     /// Context rows without a draft: `n` rows of taps (device, [n][5 * n_embd]) for positions pos0 ... pos0 + n - 1.

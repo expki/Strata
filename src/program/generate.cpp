@@ -6319,8 +6319,18 @@ int main(int argc, char** argv) {
     // In particular WDDM can refuse the draft weights after mapping tens of GiB of host pages.
     strata::core::MtpDrafter mtp;
 #if defined(STRATA_HAVE_DFLASH2)
-    strata::core::Dflash2Drafter df2;   // --draft dflash2 (CLI spec loop only)
+    strata::core::Dflash2Drafter df2;   // --draft dflash2
     bool use_df2 = false;
+    std::string df2_vocab;   // the draft vocabulary DFlash2 binds under --serve, "" for the whole head
+    int df2_cap = o.spec;    // the widest window DFlash2 fills under --serve
+    // the window cap measured best on card 0, 0 for --spec as given
+    auto df2_card_cap = [](const cudaDeviceProp& dp) -> int {
+#if defined(STRATA_USE_HIP)
+        return strata::core::dflash2_auto_cap(strata::kernels::gfx_arch_is_gfx1151(dp.gcnArchName), 0);
+#else
+        return strata::core::dflash2_auto_cap(false, dp.major);
+#endif
+    };
 #endif
     // the draft layer's geometry (the canonical model's MTP head), `static` because MtpDrafter keeps a reference; the batch
     // slots' draft-KV copies use this one too
@@ -6331,6 +6341,27 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "strata generate: STRATA_KVA was removed, every prompt is read exactly\n");
     for (const char* gone : {"STRATA_ROUTE_TAIL_SKIP", "STRATA_ROUTE_RESIDENT", "STRATA_ROUTE_RESIDENT_MTP", "STRATA_ROUTE_PRIOR"})
         if (std::getenv(gone) != nullptr) std::fprintf(stderr, "strata generate: %s was removed, every routed expert is computed\n", gone);
+#if defined(STRATA_HAVE_DFLASH2)
+    // --serve --draft dflash2 loads DFlash2 before MTP, and on success MTP is never loaded
+    if (o.serve && o.draft == "dflash2") {
+        const char* why = multi_gpu || o.batch > 0 || o.pipeline_windows >= 2 ? "it is not built for --batch, a layer split or --pipeline-windows 2"
+                          : !native_pack ? "it needs a native pack" : nullptr;
+        if (why == nullptr && df2.load(o.draft_model, 0, err)) {
+            use_df2 = true;
+            df2_vocab = !o.mtp_draft_vocab.empty() ? o.mtp_draft_vocab : o.mtp.empty() ? std::string() : o.mtp + "/draft_vocab.bin";
+            cudaDeviceProp dp{};
+            const int cap = o.draft_cap > 0 ? o.draft_cap : cudaGetDeviceProperties(&dp, 0) == cudaSuccess ? df2_card_cap(dp) : 0;
+            if (cap > 0 && cap < o.spec) {
+                df2_cap = cap;
+                std::fprintf(stderr, "strata serve: --draft dflash2: windows capped at %d tokens (%s; --draft-cap N changes it)\n", cap,
+                             o.draft_cap > 0 ? "as asked" : "the width measured best on this card");
+            }
+            o.mtp.clear();
+        } else {
+            std::fprintf(stderr, "strata serve: --draft dflash2 is off: %s; the MTP drafts instead\n", why != nullptr ? why : err.c_str());
+        }
+    }
+#endif
     if (!o.mtp.empty()) {
         if (o.spec < 2) {
             std::fprintf(stderr, "strata generate: --mtp is ignored without --spec T (T >= 2)\n");
@@ -6351,10 +6382,10 @@ int main(int argc, char** argv) {
         if (!o.mtp.empty() && !mtp.load(o.mtp, draft_geometry, last_st && !mtp_first ? last_st->ss : ss, mtp_t, err, o.mtp_window)) { std::fprintf(stderr, "strata generate: %s%s\n", err.c_str(), vram_free_note().c_str()); return 1; }
         mtp.set_ple_session(&ss);
 #if defined(STRATA_HAVE_DFLASH2)
-        if (o.draft == "dflash2") {
+        if (o.draft == "dflash2" && !o.serve) {   // (--serve chose above)
             const char* why = o.mtp.empty() ? "it needs --mtp (the fallback) and --spec 2 or more"
                               : !native_pack ? "it needs a native pack"
-                              : multi_gpu || o.batch > 0 || o.serve ? "it is for one card and the CLI run (not --serve, --batch or a layer split) in this build"
+                              : multi_gpu || o.batch > 0 ? "it is not built for --batch, a layer split or --pipeline-windows 2"
                               : o.draft_model.empty() ? "it needs --draft-model PACK (tools/dflash2_pack.py)" : nullptr;
             if (why == nullptr) {
                 if (df2.load(o.draft_model, 0, err)) {
@@ -6364,17 +6395,7 @@ int main(int argc, char** argv) {
                     // Recommend, never force: the window is capped for the card unless --draft-cap says otherwise, and a small NVIDIA card gets one plain line.
                     cudaDeviceProp dp{};
                     if (cudaGetDeviceProperties(&dp, 0) == cudaSuccess) {
-#if defined(STRATA_USE_HIP)
-                        const bool uma = strata::kernels::gfx_arch_is_gfx1151(dp.gcnArchName);
-#else
-                        const bool uma = false;
-#endif
-#if defined(STRATA_USE_HIP)
-                        const int cc_major = 0;
-#else
-                        const int cc_major = dp.major;
-#endif
-                        const int cap = o.draft_cap > 0 ? o.draft_cap : strata::core::dflash2_auto_cap(uma, cc_major);
+                        const int cap = o.draft_cap > 0 ? o.draft_cap : df2_card_cap(dp);
                         if (cap > 0 && o.spec > cap) {
                             std::fprintf(stderr, "strata generate: --draft dflash2: windows capped at %d tokens (%s; --draft-cap N changes it)\n", cap,
                                          o.draft_cap > 0 ? "as asked" : "the width measured best on this card");
@@ -6435,6 +6456,17 @@ int main(int argc, char** argv) {
     if (wo == nullptr) { std::fprintf(stderr, "strata generate: output.weight is missing\n"); return 1; }
     const int64_t n_vocab = wo->ne1;
     strata::core::NativeHead native_head;
+#if defined(STRATA_HAVE_DFLASH2)
+    // DFlash2's VRAM taken after the expert cache is sized: its draft head and logits, under --serve also the prompt tap staging
+    auto df2_bind_bytes = [&]() -> int64_t {
+        if (!o.serve) return (int64_t) mtp.bind_bytes(native_head.row_bytes(), n_vocab) + (48 << 20);
+        int64_t b = 48 << 20;
+        std::error_code ec;
+        const uintmax_t sz = df2_vocab.empty() ? 0 : std::filesystem::file_size(df2_vocab, ec);
+        if (!ec && sz >= 4) b += (int64_t) (sz / 4) * (int64_t) native_head.row_bytes() + (int64_t) sz;
+        return b + 2047 * (int64_t) df2.tap_layers().size() * df2.n_embd() * 4;
+    };
+#endif
     if (!o.native_head_gguf.empty() && !multi_gpu) {   // a layer split's head is on its last stage
         const auto head_t0 = std::chrono::steady_clock::now();
         if (!native_head.load(o.native_head_shards, g.n_embd, n_vocab, err)) {
@@ -6743,7 +6775,7 @@ int main(int argc, char** argv) {
                         int64_t mtp_b = (!o.mtp.empty() && native_head.loaded())
                                             ? (int64_t) mtp.bind_bytes(native_head.row_bytes(), n_vocab) : 0;
 #if defined(STRATA_HAVE_DFLASH2)
-                        if (use_df2 && native_head.loaded()) mtp_b += (int64_t) mtp.bind_bytes(native_head.row_bytes(), n_vocab) + (48 << 20);   // DFlash2's own draft head and logits
+                        if (use_df2 && native_head.loaded()) mtp_b += df2_bind_bytes();   // DFlash2's own draft head and logits
 #endif
                         if (stages.empty())
                             for (const auto& d : slot_mtp) mtp_b += (int64_t) d->bind_bytes(native_head.row_bytes(), n_vocab);
@@ -6990,7 +7022,7 @@ int main(int argc, char** argv) {
             for (const auto& d : slot_mtp)
                 mtp_bind += (int64_t) d->bind_bytes(native_head.row_bytes(), n_vocab);
 #if defined(STRATA_HAVE_DFLASH2)
-        if (use_df2 && native_head.loaded()) mtp_bind += (int64_t) mtp.bind_bytes(native_head.row_bytes(), n_vocab) + (48 << 20);   // DFlash2's own draft head and logits, bound after this
+        if (use_df2 && native_head.loaded()) mtp_bind += df2_bind_bytes();   // DFlash2's own draft head and logits, bound after this
 #endif
         // beside the whole pinned copy the copy's registration and the verify captures come after this, unless the reserve was given
         const bool copy_card = whole_copy_card && !multi_gpu && !o.vram_reserve_given;
@@ -10469,6 +10501,9 @@ int main(int argc, char** argv) {
         ver.set_remote_expert_opt(remote_opt.get());
         if (pcie_balance() && n_stages == 1) ver.set_pcie_balance(&drive.d.pcie_model);
         if (batch_mtp) ver.set_batch_graph_limit(64);   // --batch-mtp only: slot rotation makes many layouts (LRU); 0.1.39 keeps all
+#if defined(STRATA_HAVE_DFLASH2)
+        if (use_df2) ver.set_taps(df2.tap_layers());
+#endif
         if (!ver.init(wt, g, ss, vh, native_head.loaded() || prefill_head_alias_bound ? &native_head : nullptr,
                       batch_max_t(), err) ||
             (use_mtp && !prefill_head_alias_bound && !mtp.bind(last_st && !mtp_first ? last_st->wt : wt, last_st ? &last_st->head : &native_head,
@@ -10479,6 +10514,20 @@ int main(int argc, char** argv) {
         // the model drafter the loop drafts from, none without --mtp
         std::unique_ptr<strata::program::ServeDrafter> serve_drafter;
         if (use_mtp) serve_drafter = strata::program::make_mtp_serve_drafter(mtp);
+#if defined(STRATA_HAVE_DFLASH2)
+        if (use_df2) {   // the expert cache is sized, so MTP cannot stand in any more
+            if (!ver.tapping()) err = "the verifier keeps no taps here";
+            if (!ver.tapping() || !df2.bind(wt, &native_head, df2_vocab, err) || !df2.prepare(ver.tap_dev(), err)) {
+                std::fprintf(stderr, "strata serve: --draft dflash2: %s. It needs about 1.2 GiB of VRAM in all (the pack 0.76 GiB, buffers and K/V "
+                                     "ring 0.25 GiB, a draft head 0.2 GiB); --vram-reserve-mib 1900 keeps it (the expert cache gives up about "
+                                     "2.5%% of its experts to the CPU)\n", err.c_str());
+                return 1;
+            }
+            serve_drafter = strata::program::make_dflash2_serve_drafter(df2, ver, df2_cap);
+            std::fprintf(stderr, "strata serve: DFlash2 drafter on (%s, graphs captured in %.0f ms), MTP not loaded\n", o.draft_model.c_str(),
+                         df2.ms_capture);
+        }
+#endif
         // the MTP's draft K/V for the conversation snapshots, null without the MTP
         auto mtp_kv = [&]() -> const strata::core::QsaState* {
             return serve_drafter && serve_drafter->mtp() ? &serve_drafter->mtp()->kv_state() : nullptr;
@@ -15346,6 +15395,18 @@ int main(int argc, char** argv) {
             // continues from the slot with the same chunks.  #656's cooperative preemption, with a slot as the park.
             int64_t req_chunk = 0, req_chunk_len = 0;   // the DONE line's chunk=: the longest batched segment's first chunk
             auto read_part = [&](int64_t a0, int64_t b0, std::string& e) -> bool {
+                // a drafter that reads prompt taps gets the last 2047 rows of every chunk, until this read ends
+                struct ChunkTaps {
+                    strata::prefill::Prefill* sp = nullptr;
+                    ~ChunkTaps() { if (sp != nullptr) sp->clear_taps(); }
+                } chunk_taps;
+                if (serve_drafter && !serve_drafter->tap_layers().empty()) {
+                    sp.set_chunk_taps(serve_drafter->tap_layers(), 2047);
+                    sp.on_taps = [&](const float* taps, int64_t rows, int64_t pos0, std::string& te) -> bool {
+                        return serve_drafter->prompt_rows(taps, rows, pos0, te);
+                    };
+                    chunk_taps.sp = &sp;
+                }
                 // --prefill-pipe on a layer split: the segment's chunk is planned ONCE, on its whole length (or taken
                 // from the read it goes on from: resume_plan), and every run of it reads in that chunk (force_chunk) -
                 // the same chunks whether it is read in one run, in pieces beside decoding slots, or goes on after a
@@ -16096,6 +16157,8 @@ int main(int argc, char** argv) {
             const size_t WS = (size_t) std::max(S, merge_T);
             std::vector<int32_t> drafts(DS, 0), window(WS), outv(WS);
             std::vector<float> dprob(DS, 0.0f);
+            bool draft_probs = true;   // the drafter gave probabilities the min-p rule reads, else it cut its drafts itself
+            int draft_keep = 0;        // the drafts it kept when it cut them itself
             std::array<float, 8> dwin_s{};   // the probabilities the current window was chosen from (STRATA_SPEC_COST)
             std::vector<int32_t> sbuf((size_t) S, 0);
             const bool sfx_on = o.suffix_draft > 0 || o.lookup_chain > 0;
@@ -16842,9 +16905,12 @@ int main(int argc, char** argv) {
                     T = proposal.T; from_sfx = proposal.from_sfx;
                     if (first_window && merge_T > 0) T = merge_T;   // STRATA_ADMIT_MERGE_FIRST: the prompt's last tokens ride in this window
                 } else {
-                    T = serve_drafter ? S_mtp : 1;   // no --mtp: one token a round unless a lookup draft fires
+                    // no drafter: one token a round unless a lookup draft fires
+                    T = serve_drafter ? std::min(S_mtp, serve_drafter->max_window()) : 1;
                     if (serve_drafter && serve_drafter->mtp() && spec_cost && !first_window) {
                         T = std::clamp(chain_rows, 1, S_mtp);
+                    } else if (serve_drafter && !draft_probs) {
+                        T = std::min(T, 1 + draft_keep);
                     } else if (serve_drafter && req_spec_min_p > 0.0) {
                         T = 1;
                         while (T < S_mtp && dprob[(size_t) T - 1] >= (float) req_spec_min_p) ++T;
@@ -17158,6 +17224,8 @@ int main(int argc, char** argv) {
                 generation = {};   // a skipped or failed production must not expose an older q view
                 const GatedDraftLimit draft_limit(mtp, gated_proposal, S_mtp, p + a + 1, o.max_context);
                 bool drafted = !serve_drafter || eos || produced_n >= max_new;
+                // the last window's rows still reach the drafter, so its context ends where the session does
+                if (serve_drafter && drafted && !serve_drafter->window_rows(ver, a + 1, p, err)) drafted = false;
                 if (!drafted && gated_proposal) {   // MTP-only: the gated proposal reads the DraftResult only MtpDrafter fills
                     drafted = serve_drafter->mtp()->draft(T, outv.data(), p, a, drafts.data(), err, dprob.data(),
                                                           (float) req_spec_min_p, nullptr, &generation);
@@ -17168,6 +17236,8 @@ int main(int argc, char** argv) {
                         const int k = std::min(serve_drafter->max_window() - 1, 8);
                         std::copy(dr.tok, dr.tok + k, drafts.begin());
                         std::copy(dr.prob, dr.prob + k, dprob.begin());
+                        draft_probs = dr.has_prob;
+                        draft_keep = dr.n;
                     }
                 }
                 {
@@ -17601,6 +17671,7 @@ int main(int argc, char** argv) {
                          prompt_ms > 0 ? 1000.0 * read_n / prompt_ms : 0.0, (long long) produced_n, decode_ms,
                          decode_ms > 0 ? 1000.0 * produced_n / decode_ms : 0.0, (long long) draft_accepted,
                          (long long) draft_offered, checks.size(), cancelled ? " (cancelled)" : "");
+            if (serve_drafter) serve_drafter->report(stderr);
             if (serve_adapt_drain_ms >= 1.0)
                 std::fprintf(stderr, "strata serve: the request first waited %.0f ms for the adaptive tier's round in flight\n",
                              serve_adapt_drain_ms);

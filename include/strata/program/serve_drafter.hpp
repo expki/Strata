@@ -8,6 +8,7 @@
 #include <vector>
 
 namespace strata::core {
+class Dflash2Drafter;
 class MtpDrafter;
 class Verifier;
 }
@@ -38,9 +39,14 @@ public:
     virtual bool restore_window(const std::vector<uint8_t>& /*in*/, int64_t /*upto*/, const char* /*kind*/, std::string& /*err*/) {
         return true;
     }
+    virtual void clear_window(int64_t /*upto*/) {}                           // drop the context, rows from upto on come next
     virtual void report(FILE* f) const = 0;                                  // rounds, ms a round, VRAM
 };
 
 std::unique_ptr<ServeDrafter> make_mtp_serve_drafter(core::MtpDrafter& mtp);
+#if defined(STRATA_HAVE_DFLASH2)
+// max_window() is min(cap, 1 + kDrafts), with cap already at most --spec
+std::unique_ptr<ServeDrafter> make_dflash2_serve_drafter(core::Dflash2Drafter& d, const core::Verifier& ver, int cap);
+#endif
 
 }  // namespace strata::program

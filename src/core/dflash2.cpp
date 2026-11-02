@@ -493,8 +493,10 @@ struct WindowHeader {
     uint32_t version;
     int64_t upto;
     int32_t rows, layers, heads, head_dim;
+    int64_t floor;   // the clear_ring floor at the save, restored with the window
 };
 constexpr uint32_t kWindowMagic = 0x57324644;   // "DF2W"
+constexpr uint32_t kWindowVersion = 2;          // 2 added the floor
 
 }  // namespace
 
@@ -521,7 +523,7 @@ bool Dflash2Drafter::save_window(int64_t upto, std::vector<uint8_t>& out, std::s
     const int rows = (int) std::min<int64_t>(upto, kWindow);
     const size_t plane = (size_t) rows * NKV_ * HD_ * 2;
     out.resize(window_bytes(upto));
-    const WindowHeader h{kWindowMagic, 1, upto, rows, L_, NKV_, HD_};
+    const WindowHeader h{kWindowMagic, kWindowVersion, upto, rows, L_, NKV_, HD_, std::min(floor_, upto)};
     std::memcpy(out.data(), &h, sizeof h);
     uint8_t* at = out.data() + sizeof h;
     try {
@@ -543,9 +545,10 @@ bool Dflash2Drafter::restore_window(const std::vector<uint8_t>& in, int64_t upto
     WindowHeader h;
     if (upto < 0 || in.size() < sizeof h) { err = "dflash2: the saved window is cut short"; return false; }
     std::memcpy(&h, in.data(), sizeof h);
-    if (h.magic != kWindowMagic || h.version != 1) { err = "dflash2: not a saved window"; return false; }
+    if (h.magic != kWindowMagic || h.version != kWindowVersion) { err = "dflash2: not a saved window"; return false; }
     if (h.upto != upto) { err = "dflash2: the window was saved at position " + std::to_string(h.upto) + ", not " + std::to_string(upto); return false; }
-    if (h.layers != L_ || h.heads != NKV_ || h.head_dim != HD_ || h.rows != (int32_t) std::min<int64_t>(upto, kWindow) || in.size() != window_bytes(upto)) {
+    if (h.layers != L_ || h.heads != NKV_ || h.head_dim != HD_ || h.rows != (int32_t) std::min<int64_t>(upto, kWindow) || in.size() != window_bytes(upto) ||
+        h.floor < 0 || h.floor > upto) {
         err = "dflash2: the saved window has another layout";
         return false;
     }
@@ -565,7 +568,7 @@ bool Dflash2Drafter::restore_window(const std::vector<uint8_t>& in, int64_t upto
         return false;
     }
     have_ctx_ = upto;
-    floor_ = 0;
+    floor_ = h.floor;
     return true;
 }
 

@@ -219,6 +219,30 @@ int main(int argc, char** argv) {
         // the rope angles differ by 1000 positions so the rows are close, not bitwise, and without the floor the cosine is 0.45
         expect(tokens_equal(R, G) && cg > 0.99, "(g) clear_ring(1000) then 100 rows drafts like a context of those 100 rows alone");
     }
+    {   // (j) a window saved above a clear_ring floor keeps that floor through a restore into a fresh drafter
+        Dflash2Drafter live, fresh;
+        Answer L{}, L2{}, F{};
+        std::vector<float> rows_live, rows_fresh;
+        std::vector<uint8_t> wf;
+        if (!open(live) || !context(live, t2, 0, 300, 0)) return 1;
+        live.clear_ring(1000);
+        if (!context(live, t1, 0, 100, 1000)) return 1;
+        expect(live.save_window(1100, wf, err), "(j) save_window above the floor");
+        if (!draft(live, t1, 100, 1100, L)) return 1;
+        live.debug_rows(rows_live, err);
+        // the FP16 reference, the live ring restored from its own window
+        if (!live.restore_window(wf, 1100, err) || !draft(live, t1, 100, 1100, L2)) { std::fprintf(stderr, "restore in place: %s\n", err.c_str()); return 1; }
+        if (!open(fresh)) return 1;
+        expect(fresh.restore_window(wf, 1100, err), "(j) restore_window into a fresh drafter");
+        if (!draft(fresh, t1, 100, 1100, F)) return 1;
+        fresh.debug_rows(rows_fresh, err);
+        info(L, F, "(j) restored drafts against the live FP32 ring above the floor");
+        const double cj = min_cosine(rows_live, rows_fresh);
+        std::printf("  final rows min cosine %.7f\n", cj);
+        // without the floor the restored ring reads the 1000 zero rows below it as keys, cosine 0.45
+        expect(cj > kMinCos, "(j) a restored window above clear_ring(1000) keeps the live ring's final rows");
+        same(L2, F, "(j) the fresh drafter drafts like the live ring restored in place");
+    }
     {   // (e) the ring wraps twice
         const int n = 5000;
         const int64_t u = n - 1;
