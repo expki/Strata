@@ -16,6 +16,7 @@
 // block; the host stages the positions and the anchor and waits for the 7 drafts.
 #pragma once
 
+#include "strata/core/dflash2_file.hpp"
 #include "strata/core/session.hpp"
 
 #include <cuda_runtime.h>
@@ -41,7 +42,7 @@ public:
     Dflash2Drafter(const Dflash2Drafter&) = delete;
     Dflash2Drafter& operator=(const Dflash2Drafter&) = delete;
 
-    /// Reads the pack (tools/dflash2_pack.py) to the GPU `device` and allocates the ring and the buffers (about 0.8 GB).
+    /// Reads the drafter file (the pack of tools/dflash2_pack.py or the incoai GGUF, see dflash2_file.hpp) to the GPU `device` and allocates the ring and the buffers (about 0.8 GB).
     bool load(const std::string& pack_path, int device, std::string& err);
     /// The target's embedding and head (and the draft vocabulary file, "" or missing: the whole head).
     bool bind(const WeightTable& wt, const NativeHead* head, const std::string& vocab_file, std::string& err);
@@ -73,7 +74,7 @@ public:
     int64_t rounds = 0;
 
 private:
-    struct Tensor { std::string name, dtype; int64_t rows = 0, cols = 0; uint64_t off = 0, bytes = 0; };
+    using Tensor = Dflash2Tensor;
     const Tensor& find(const std::string& name) const;
     const void* q8(const std::string& name) const { return blob_ + find(name).off; }
     const float* f32(const std::string& name) const { return reinterpret_cast<const float*>(blob_ + find(name).off); }

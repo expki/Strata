@@ -344,6 +344,10 @@ add_library(strata_artifact INTERFACE)
 target_include_directories(strata_artifact INTERFACE ${CMAKE_CURRENT_SOURCE_DIR}/include)
 target_link_libraries(strata_artifact INTERFACE strata_warnings)
 
+# the DFlash2 drafter's file (DF2P pack or incoai GGUF) on the host: no GPU code, so its CPU test and the compare tool link it alone
+add_library(strata_dflash2_file STATIC src/core/dflash2_file.cpp)
+target_link_libraries(strata_dflash2_file PUBLIC strata_artifact)
+
 add_executable(strata-gguf src/artifact/gguf_reader.cpp)
 target_link_libraries(strata-gguf PRIVATE strata_artifact)
 
@@ -771,7 +775,7 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     src/core/arch_defaults.cpp src/core/nv_defaults.cpp src/core/vmm.cpp src/core/conversation_file.cpp
     src/core/xtier.cpp src/core/peer_adapt.cpp)
   target_include_directories(strata_engine PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
-  target_link_libraries(strata_engine PUBLIC strata_core strata_kernels strata_kernels_cpu ${_strata_gpu_runtime_target})
+  target_link_libraries(strata_engine PUBLIC strata_core strata_kernels strata_kernels_cpu strata_dflash2_file ${_strata_gpu_runtime_target})
   if(NOT WIN32)
     target_link_libraries(strata_engine PUBLIC ${CMAKE_DL_LIBS})   # src/core/xtier.cpp opens the AMD tier library
   endif()
@@ -1000,6 +1004,8 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
 
   # DFlash2 drafter tools (not built by default: cmake --build <dir> --target dflash2_parity dflash2_gemm_bench dflash2_attn_bench): the drafter against
   # the torch port on a synthetic case (needs the pack and a case file, tools/dflash2/mk_parity_case.py), and the timing of its Q8 GEMM and attention
+  add_executable(dflash2_file_compare EXCLUDE_FROM_ALL src/core/dflash2_file_compare.cpp)
+  target_link_libraries(dflash2_file_compare PRIVATE strata_dflash2_file)
   add_executable(dflash2_parity EXCLUDE_FROM_ALL src/core/dflash2_parity.cpp)
   target_include_directories(dflash2_parity PRIVATE ${_strata_gpu_include_directories})
   target_link_libraries(dflash2_parity PRIVATE strata_engine strata_kernels ${_strata_gpu_runtime_target})
@@ -1953,6 +1959,10 @@ if(STRATA_BUILD_TESTS OR STRATA_BUILD_CONVERSATION_TESTS)
   add_executable(draft_cap_test src/core/draft_cap_test.cpp)
   target_include_directories(draft_cap_test PRIVATE include)
   add_test(NAME draft_cap_test COMMAND draft_cap_test)
+  # the DFlash2 drafter file: the GGUF name map, Q8_0 to bf16 and a synthetic GGUF (CPU)
+  add_executable(dflash2_file_test src/core/dflash2_file_test.cpp)
+  target_link_libraries(dflash2_file_test PRIVATE strata_dflash2_file)
+  add_test(NAME dflash2_file_test COMMAND dflash2_file_test)
   # the f32 -> bf16 rounding against ggml's, NaN included, over every f32 bit pattern (header-only, CPU)
   add_executable(bf16_bits_test src/kernels/bf16_bits_test.cpp)
   target_include_directories(bf16_bits_test PRIVATE include)

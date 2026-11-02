@@ -122,48 +122,31 @@ const Dflash2Drafter::Tensor& Dflash2Drafter::find(const std::string& name) cons
 bool Dflash2Drafter::load(const std::string& path, int device, std::string& err) {
     device_ = device;
     const OnDevice on_device(device_);
-    std::FILE* f = std::fopen(path.c_str(), "rb");
-    if (f == nullptr) { err = "dflash2: cannot open " + path; return false; }
-    struct Closer { std::FILE* f; ~Closer() { std::fclose(f); } } closer{f};
-    uint32_t hdr[3];
-    if (std::fread(hdr, 4, 3, f) != 3 || std::memcmp(hdr, "DF2P", 4) != 0 || hdr[1] != 1) { err = "dflash2: " + path + " is not a DF2P v1 pack"; return false; }
-    std::string index(hdr[2], ' ');
-    if (std::fread(index.data(), 1, hdr[2], f) != hdr[2]) { err = "dflash2: the pack's index is cut short"; return false; }
-    const long data_off = 12 + (long) hdr[2];
-    uint64_t total = 0;
-    for (size_t i = 0; i < index.size();) {
-        const size_t j = index.find('\n', i);
-        if (j == std::string::npos) break;
-        const std::string line = index.substr(i, j - i);
-        i = j + 1;
-        char a[256], b[64], c[256];
-        long long v1, v2, v3, v4;
-        if (std::sscanf(line.c_str(), "cfg %63s %255s", b, c) == 2) {
-            const std::string key = b;
-            if (key == "hidden") N_ = std::atoi(c);
-            else if (key == "layers") L_ = std::atoi(c);
-            else if (key == "heads") NH_ = std::atoi(c);
-            else if (key == "kv_heads") NKV_ = std::atoi(c);
-            else if (key == "head_dim") HD_ = std::atoi(c);
-            else if (key == "inter") I_ = std::atoi(c);
-            else if (key == "window") window_ = std::atoi(c);
-            else if (key == "rope_theta") theta_ = (float) std::atof(c);
-            else if (key == "eps") eps_ = (float) std::atof(c);
-            else if (key == "conv_group") group_ = std::atoi(c);
-            else if (key == "rank") rank_ = std::atoi(c);
-            else if (key == "mask_token") mask_token_ = std::atoi(c);
-            else if (key == "vocab") vocab_ = std::atoll(c);
-            else if (key == "taps") {
-                taps_.clear();
-                for (const char* q = c; *q;) { taps_.push_back(std::atoi(q)); while (*q && *q != ',') ++q; if (*q == ',') ++q; }
-            }
-        } else if (std::sscanf(line.c_str(), "t %255s %63s %lld %lld %lld %lld", a, b, &v1, &v2, &v3, &v4) == 6) {
-            Tensor t;
-            t.name = a; t.dtype = b; t.rows = v1; t.cols = v2; t.off = (uint64_t) v3; t.bytes = (uint64_t) v4;
-            tensors_.push_back(t);
-            total = std::max(total, t.off + t.bytes);
+    const std::unique_ptr<Dflash2Source> src = Dflash2Source::open(path, err);
+    if (!src) return false;
+    for (const auto& [key, val] : src->cfg()) {
+        const char* c = val.c_str();
+        if (key == "hidden") N_ = std::atoi(c);
+        else if (key == "layers") L_ = std::atoi(c);
+        else if (key == "heads") NH_ = std::atoi(c);
+        else if (key == "kv_heads") NKV_ = std::atoi(c);
+        else if (key == "head_dim") HD_ = std::atoi(c);
+        else if (key == "inter") I_ = std::atoi(c);
+        else if (key == "window") window_ = std::atoi(c);
+        else if (key == "rope_theta") theta_ = (float) std::atof(c);
+        else if (key == "eps") eps_ = (float) std::atof(c);
+        else if (key == "conv_group") group_ = std::atoi(c);
+        else if (key == "rank") rank_ = std::atoi(c);
+        else if (key == "mask_token") mask_token_ = std::atoi(c);
+        else if (key == "vocab") vocab_ = std::atoll(c);
+        else if (key == "taps") {
+            taps_.clear();
+            for (; *c;) { taps_.push_back(std::atoi(c)); while (*c && *c != ',') ++c; if (*c == ',') ++c; }
         }
     }
+    tensors_ = src->tensors();
+    uint64_t total = 0;
+    for (const Tensor& t : tensors_) total = std::max(total, t.off + t.bytes);
     if (tensors_.empty() || NH_ != 32 || NKV_ != 8 || HD_ != 128 || rank_ != 256 || N_ != 2560 || L_ > 8 || window_ + 16 > kRing) {
         err = "dflash2: the pack's shape is not the Flash-Next drafter this engine was written for";
         return false;
@@ -177,12 +160,7 @@ bool Dflash2Drafter::load(const std::string& path, int device, std::string& err)
     if (cudaMalloc((void**) &tmp, max_bytes) != cudaSuccess) { err = "dflash2: upload scratch"; return false; }
     struct TmpFree { uint8_t* p; ~TmpFree() { cudaFree(p); } } tmp_free{tmp};
     for (const Tensor& t : tensors_) {
-#if defined(_WIN32)
-        _fseeki64(f, data_off + (long long) t.off, SEEK_SET);
-#else
-        fseeko(f, data_off + (off_t) t.off, SEEK_SET);
-#endif
-        if (std::fread(stage.data(), 1, t.bytes, f) != t.bytes) { err = "dflash2: the pack is shorter than its index"; return false; }
+        if (!src->read(t, stage.data(), err)) return false;
         if (t.dtype == "q8_0") {   // GGUF blocks -> the tiled qs plane at the tensor's offset, then the d plane (same total bytes)
             if (cudaMemcpy(tmp, stage.data(), t.bytes, cudaMemcpyHostToDevice) != cudaSuccess) { err = "dflash2: weight upload failed"; return false; }
             kernels::df2_q8_tile(tmp, blob_ + t.off, blob_ + t.off + (uint64_t) t.rows * (uint64_t) t.cols, (int) t.cols, t.rows * t.cols / 32, nullptr);
