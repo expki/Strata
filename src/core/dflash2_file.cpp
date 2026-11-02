@@ -115,7 +115,7 @@ private:
         const MetaValue& taps = meta("dflash.target_layers");
         if (taps.type != MetaType::ARRAY || taps.items.empty()) throw std::runtime_error("dflash.target_layers is not an array");
         std::string list;
-        for (const MetaValue& v : taps.items) list += (list.empty() ? "" : ",") + std::to_string((long long) v.num());
+        for (const MetaValue& v : taps.items) list += (list.empty() ? "" : ",") + std::to_string((long long) v.num() - 1);   // the GGUF counts the embedding as 0
         cfg_["taps"] = list;
 
         uint64_t off = 0;

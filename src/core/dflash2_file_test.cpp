@@ -122,7 +122,7 @@ int main() {
             CHECK(c.at("heads") == "32" && c.at("kv_heads") == "8" && c.at("head_dim") == "128");
             CHECK(c.at("window") == "2048" && c.at("block") == "8" && c.at("conv_group") == "16" && c.at("conv_kernel") == "2");
             CHECK(c.at("rank") == "256" && c.at("top_k") == "16" && c.at("mask_token") == "248077" && c.at("vocab") == "2");
-            CHECK(c.at("taps") == "6,16");
+            CHECK(c.at("taps") == "5,15");
             CHECK(std::atof(c.at("rope_theta").c_str()) == 10000.0 && (float) std::atof(c.at("eps").c_str()) == 1e-6f);
             const auto& ts = src->tensors();
             CHECK(ts.size() == 4);
