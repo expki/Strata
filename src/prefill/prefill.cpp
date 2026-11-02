@@ -1338,6 +1338,7 @@ void Prefill::clear_taps() {
         tap_dev_ = nullptr;
     }
     tap_layers_.clear();
+    tap_per_chunk_ = 0;
     on_taps = nullptr;
 }
 
@@ -4028,8 +4029,8 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
         const int64_t run_chunk = hand_in_ == nullptr ? C : chunk_tokens_;   // the run's chunk size, as only its full chunks are timed
         core::progress_at("reading the prompt (batched): preparing the chunk from token", p0);   // #251
 #if defined(STRATA_HAVE_DFLASH2)
-        // DFlash2 prompt taps: the rows of this chunk at positions >= tap_first_ (the drafter looks back one window)
-        const int64_t tap_t0 = tap_dev_ != nullptr ? std::min<int64_t>(T, std::max<int64_t>(0, tap_first_ - p0)) : T;
+        // DFlash2 prompt taps: the rows at positions >= tap_first_, or the last rows of every chunk (the drafter looks back one window)
+        const int64_t tap_t0 = tap_dev_ != nullptr ? chunk_tap_first(T, p0, tap_first_, tap_per_chunk_) : T;
         const int64_t tap_rows = T - tap_t0;
         if (tap_rows > tap_cap_) { err = "prefill: the DFlash2 tap staging is smaller than the chunk's tapped rows"; return false; }
 #else

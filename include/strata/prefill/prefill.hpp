@@ -15,6 +15,7 @@
 #include "strata/core/layer.hpp"
 #include "strata/core/session.hpp"
 #include "strata/core/weights.hpp"
+#include "strata/prefill/chunk_taps.hpp"
 #include "strata/prefill/expert_planner.hpp"
 #include "strata/prefill/tier_planner.hpp"
 
@@ -230,7 +231,9 @@ public:
     /// mean of the hc streams) for the prompt rows at positions >= `first_pos`, at most `cap_rows` rows per chunk (a staging buffer of
     /// cap_rows x layers x n_embd floats is allocated at the first chunk).  After each chunk that has such rows, on_taps(taps
     /// [rows][layers][n_embd] device, rows, first position, err) runs with the stream synchronized.  clear_taps frees the staging.
-    void set_taps(const std::vector<int>& layers, int64_t first_pos, int64_t cap_rows) { tap_layers_ = layers; tap_first_ = first_pos; tap_cap_ = cap_rows; }
+    void set_taps(const std::vector<int>& layers, int64_t first_pos, int64_t cap_rows) { tap_layers_ = layers; tap_first_ = first_pos; tap_cap_ = cap_rows; tap_per_chunk_ = 0; }
+    /// The server's form of set_taps: every chunk taps its last `per_chunk` rows (2047), so the drafter holds the window ending at each chunk end.
+    void set_chunk_taps(const std::vector<int>& layers, int64_t per_chunk) { tap_layers_ = layers; tap_first_ = -1; tap_cap_ = per_chunk; tap_per_chunk_ = per_chunk; }
     void clear_taps();
     std::function<bool(const float* taps, int64_t rows, int64_t pos0, std::string& err)> on_taps;
 
@@ -327,7 +330,7 @@ private:
 
     int64_t stage_lb_ = 0, stage_le_ = -1;
     std::vector<int> tap_layers_;
-    int64_t tap_first_ = 0, tap_cap_ = 0;
+    int64_t tap_first_ = 0, tap_cap_ = 0, tap_per_chunk_ = 0;   // tap_per_chunk_ > 0: the last rows of every chunk
     float* tap_dev_ = nullptr;
     Prefill* next_ = nullptr;
     Prefill* helper_ = nullptr;         ///< set_stage_helper
