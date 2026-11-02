@@ -2,7 +2,7 @@
 //
 //     dflash2_file_compare <pack> <gguf>
 //
-// Checks the same tensor set (name, dtype, shape), every cfg key, the bytes of each q8_0 and f32 tensor, and each bf16 codebook value within
+// Checks the same tensor set (name, dtype, shape), every cfg key, the bytes of each f32 tensor, each q8_0 tensor (same scales, quants at most one step apart), and each bf16 codebook value within
 // max|row| / 254 + one bf16 ulp (the GGUF holds the codebooks as Q8_0).  Prints "OK <n> tensors" or the first mismatch.
 #include "strata/core/dflash2_file.hpp"
 
@@ -73,22 +73,21 @@ int main(int argc, char** argv) {
             if (std::memcmp(da.data(), db.data(), da.size()) != 0) {
                 size_t i = 0;
                 while (da[i] == db[i]) ++i;
-                std::string what = "tensor " + g.name + " differs at byte " + std::to_string(i);
-                if (g.dtype == "q8_0") {
-                    int64_t bad_d = 0, bad_q = 0, bad_blocks = 0, maxdq = 0;
-                    for (size_t k = 0; k < da.size() / 34; ++k) {
-                        const uint8_t* x = da.data() + k * 34;
-                        const uint8_t* y = db.data() + k * 34;
-                        if (std::memcmp(x, y, 34) == 0) continue;
-                        ++bad_blocks;
-                        if (x[0] != y[0] || x[1] != y[1]) ++bad_d;
-                        for (int j = 2; j < 34; ++j)
-                            if (x[j] != y[j]) { ++bad_q; maxdq = std::max<int64_t>(maxdq, std::llabs((int64_t) (int8_t) x[j] - (int64_t) (int8_t) y[j])); }
+                const std::string what = "tensor " + g.name + " differs at byte " + std::to_string(i);
+                if (g.dtype != "q8_0") return fail(what);
+                // the pack rounds x / d, ggml x * (1 / d): they part only at near ties, by one step.  Same scales and steps of at most one pass.
+                int64_t bad_q = 0;
+                for (size_t k = 0; k < da.size() / 34; ++k) {
+                    const uint8_t* x = da.data() + k * 34;
+                    const uint8_t* y = db.data() + k * 34;
+                    if (x[0] != y[0] || x[1] != y[1]) return fail(what + " (a scale differs in block " + std::to_string(k) + ")");
+                    for (int j = 2; j < 34; ++j) {
+                        if (x[j] == y[j]) continue;
+                        ++bad_q;
+                        if (std::llabs((int64_t) (int8_t) x[j] - (int64_t) (int8_t) y[j]) > 1) return fail(what + " (a quant is off by more than one step in block " + std::to_string(k) + ")");
                     }
-                    what += " (" + std::to_string(bad_blocks) + " of " + std::to_string(da.size() / 34) + " blocks differ, " + std::to_string(bad_d) + " scales, " +
-                            std::to_string(bad_q) + " quants, largest step " + std::to_string(maxdq) + ")";
                 }
-                return fail(what);
+                std::printf("  %s: same scales, %lld of %lld quants one step apart\n", g.name.c_str(), (long long) bad_q, (long long) (da.size() / 34 * 32));
             }
         } else {
             const uint16_t* x = reinterpret_cast<const uint16_t*>(da.data());
