@@ -57,8 +57,13 @@ Today DFlash2 runs only in the command-line spec loop on one card. The server re
   which frees part of that.
 - The DFlash2 drafter needs the taps (residual rows of layers 6, 16, 26, 36, 46) of every committed row, and of the last
   2047 prompt rows. `Prefill::set_taps` and `Verifier::set_taps` already produce them.
-- Prompt taps turn off the W6800 half-split overlap for the tapped chunk (`prefill.cpp:4269`) and the layer-major walk
-  (`prefill.cpp:6484`). Measure the prompt cost; reducing it is follow-up tuning.
+- Prompt taps turn off the W6800 half-split overlap for a tapped chunk (`prefill.cpp:4269`) and the layer-major walk
+  (`prefill.cpp:6484`). Because periodic and tail checkpoints fall at chunk ends, every chunk taps its last 2047 rows
+  (found while planning, 2026-11-02), so in DFlash2 mode every chunk loses the overlap, not only the last. Measure the
+  prompt cost; reducing it is follow-up tuning. MTP mode is not affected.
+- A DFlash2 failure found after the expert cache is sized (bind, prepare) ends the start with an error naming the cause,
+  since MTP can no longer be loaded then. Failures at load time fall back to MTP.
+- Swift 1.5 names and a `"drafting_model"` config key are added to `strata_control/drafting.py` (planning, 2026-11-02).
 - Box rules: stop `strata.service` for stints, take `flock ~/bench-mixed/.box.lock`, short runs (about 5 minutes an arm),
   GPU clock settings as in the service's pin scripts, restart the service when done.
 
