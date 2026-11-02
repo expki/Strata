@@ -1311,7 +1311,8 @@ class Runner:
             archs = []
         mode = self.s.drafting if self.s.drafting is not None else cfg.get("drafting")
         return {"mode": mode, "klass": drafting.card_class(archs), "model_name": cfg.get("model_name"), "family": self.s.family,
-                "data_dir": drafting.data_dir_of(cfg.get("args") or []) or (Path(self.s.data_dir) if self.s.data_dir else None)}
+                "data_dir": drafting.data_dir_of(cfg.get("args") or []) or (Path(self.s.data_dir) if self.s.data_dir else None),
+                "drafting_model": cfg.get("drafting_model")}
 
     def ensure_drafter(self, base_path: Path) -> None:
         """Fetch the DFlash2 drafter when this launch will use it and it is not here yet. Never stops the launch: if it cannot be had, the model
@@ -1986,7 +1987,7 @@ class Runner:
             base, cfg = self.installed_state()
             want = self.drafting_inputs(cfg or {})
             return drafting.summary_line(drafting.decide(want["mode"], klass=want["klass"], model_name=want["model_name"], family=want["family"],
-                                                        data_dir=want["data_dir"]))
+                                                        data_dir=want["data_dir"], drafting_model=want["drafting_model"]))
         except Exception:                                    # noqa: BLE001
             return ""
 

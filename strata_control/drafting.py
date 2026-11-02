@@ -6,6 +6,7 @@ The choice is the person's, and it is saved in the model's run config as ``"draf
 
   mtp      the engine's default drafter, the model's own draft layer (no extra flags)
   dflash2  ``--draft dflash2 --draft-model <pack>``: the DFlash2 block drafter (incoai/Qwen3.8-Flash-Next-DFlash2) for Qwen3.8-Flash-Next
+           (``"drafting_model": "<file>"`` in the run config names the drafter file, a pack or the incoai GGUF, instead of the downloaded pack)
   off      no draft layer (the same as ``"mtp": false``: the engine still looks ahead in the text with ``--spec``)
   auto     the table below says which of mtp / dflash2 this card class gets
 
@@ -99,9 +100,10 @@ PACK_NAME = "qwen3.8-flash-next-dflash2.q8.pack"
 VRAM_GB = 1.2                # what the drafter needs in graphics memory (the engine's own estimate)
 FOLDER = "dflash2"           # under the model data folder, next to ``mtp``
 
-#: model families (strata launch --family) the drafter was trained for and measured on: Qwen3.8-Flash-Next and its Gyro build.
-SUPPORTED_FAMILIES = ("qwen", "gyro")
-_SUPPORTED_NAME = re.compile(r"^qwen3\.8-flash-next(-gyro-[a-z0-9._-]+|-(q|iq|tq)\d[a-z0-9_.]*)?$", re.IGNORECASE)
+#: model families (strata launch --family) the drafter fits: Qwen3.8-Flash-Next, its Gyro build and Swift 1.5, a fine-tune of it.
+SUPPORTED_FAMILIES = ("qwen", "gyro", "swift")
+_SUPPORTED_NAME = re.compile(r"^(qwen3\.8-flash-next(-gyro-[a-z0-9._-]+|-(q|iq|tq)\d[a-z0-9_.]*)?"
+                             r"|swift-1\.5(-qwen3\.8-flash-next)?-(q|iq|tq)\d[a-z0-9_.]*)$", re.IGNORECASE)
 
 
 def supported_model(model_name: str | None = None, family: str | None = None) -> bool:
@@ -122,6 +124,14 @@ def pack_ready(data_dir: str | Path | None) -> bool:
         return False
 
 
+def model_ready(drafting_model: str | Path | None) -> bool:
+    """A drafter file named in the run config (``"drafting_model"``) is there and is more than 1 MiB."""
+    try:
+        return bool(drafting_model) and Path(drafting_model).is_file() and Path(drafting_model).stat().st_size > (1 << 20)
+    except OSError:
+        return False
+
+
 # --------------------------------------------------------------------------------------------------- a decision
 
 
@@ -138,12 +148,8 @@ def normalize(value: Any) -> str:
     return text if text in MODES else DEFAULT_MODE
 
 
-#: Does the engine in this release run DFlash2 when it serves (the app and `strata launch`)? In f-023-int src/program/generate.cpp, `--draft dflash2`
-#: is "for one card and the CLI run (not --serve, --batch or a layer split)": a served model prints "--draft dflash2 is off: ... the MTP drafts
-#: instead". So today the choice cannot take effect when serving, and nothing is downloaded or packed for it (1.2 GB for no effect would be a bad
-#: surprise); the start says so ("Drafting: MTP (DFlash2 isn't available in this mode yet)"). Flip this when the engine serves it; everything
-#: else (flags, download, pack, fallback text) is in place and tested with it on.
-ENGINE_SERVES_DFLASH2 = False
+#: The engine drafts with DFlash2 when it serves, so the choice takes effect and the drafter is fetched.
+ENGINE_SERVES_DFLASH2 = True
 
 #: Why the MTP runs when something else was asked for: a closed set of short reasons, each one is a sentence in the interface catalog in all eight
 #: languages (the line is "Drafting: MTP (<reason>)").
@@ -159,8 +165,10 @@ def mtp_line(reason: str) -> str:
     return f"Drafting: MTP ({reason})"
 
 
-def decide(mode: Any, *, klass: str, model_name: str | None = None, family: str | None = None, data_dir: str | Path | None = None) -> Decision:
-    """The drafter a start uses. Never raises: a choice that cannot be applied becomes MTP with a note."""
+def decide(mode: Any, *, klass: str, model_name: str | None = None, family: str | None = None, data_dir: str | Path | None = None,
+           drafting_model: str | Path | None = None) -> Decision:
+    """The drafter a start uses. Never raises: a choice that cannot be applied becomes MTP with a note. ``drafting_model`` (the run config's
+    ``"drafting_model"``) names the drafter file, used instead of the downloaded pack in the data folder."""
     asked = normalize(mode)
     if asked == "off":
         return Decision(asked, "off")
@@ -171,16 +179,23 @@ def decide(mode: Any, *, klass: str, model_name: str | None = None, family: str 
         return Decision(asked, "mtp", NOT_SUPPORTED if asked == "dflash2" else "")
     if not ENGINE_SERVES_DFLASH2:
         return Decision(asked, "mtp", NOT_SERVED if asked == "dflash2" else "")
+    if drafting_model:
+        if not model_ready(drafting_model):
+            return Decision(asked, "mtp", NOT_DOWNLOADED)
+        return Decision(asked, "dflash2", flags=("--draft", "dflash2", "--draft-model", str(drafting_model)))
     if not pack_ready(data_dir):
         return Decision(asked, "mtp", NOT_DOWNLOADED)
     return Decision(asked, "dflash2", flags=("--draft", "dflash2", "--draft-model", str(pack_path(data_dir))))
 
 
-def needs_pack(mode: Any, *, klass: str, model_name: str | None = None, family: str | None = None, data_dir: str | Path | None = None) -> bool:
-    """Would this choice use the DFlash2 drafter if its file were here, and is it not here yet? (Then it is fetched before the start.)"""
+def needs_pack(mode: Any, *, klass: str, model_name: str | None = None, family: str | None = None, data_dir: str | Path | None = None,
+               drafting_model: str | Path | None = None) -> bool:
+    """Would this choice use the DFlash2 drafter if its file were here, and is it not here yet? (Then it is fetched before the start.) A file
+    the run config names (``drafting_model``) is never fetched."""
     asked = normalize(mode)
     want = suggest(klass) if asked == "auto" else asked
-    return want == "dflash2" and ENGINE_SERVES_DFLASH2 and supported_model(model_name, family) and not pack_ready(data_dir)
+    return (want == "dflash2" and ENGINE_SERVES_DFLASH2 and supported_model(model_name, family) and not drafting_model
+            and not pack_ready(data_dir))
 
 
 DRAFT_FLAGS = {"--draft": True, "--draft-model": True}
@@ -215,7 +230,8 @@ def data_dir_of(args: list[Any]) -> Path | None:
 def apply(cfg: dict[str, Any], *, klass: str, data_dir: str | Path | None = None, family: str | None = None) -> Decision:
     """Put the config's ``"drafting"`` choice on its engine arguments (in place). ``off`` is the draft layer's own switch (``"mtp": false``)."""
     from strata_control import draft_layer
-    decision = decide(cfg.get("drafting"), klass=klass, model_name=cfg.get("model_name"), family=family, data_dir=data_dir)
+    decision = decide(cfg.get("drafting"), klass=klass, model_name=cfg.get("model_name"), family=family, data_dir=data_dir,
+                      drafting_model=cfg.get("drafting_model"))
     if cfg.get("drafting") is None and decision.drafter == "mtp":
         return decision                                       # nobody chose and Auto is the MTP: the arguments stay exactly as they are
     args = strip_draft_flags(cfg.get("args") or [])
@@ -235,17 +251,26 @@ def apply(cfg: dict[str, Any], *, klass: str, data_dir: str | Path | None = None
 _ON = re.compile(r"DFlash2 drafter on\b")
 
 
+#: the engine's words for a mode it does not run DFlash2 in (the serve refusal, and the older CLI only line)
+_NOT_HERE_WORDS = ("it is not built for", "it is for one card and the cli run", "needs a native pack", "it needs --mtp")
+#: the engine's words for a drafter file it could not open or read
+_NO_FILE_WORDS = ("cannot open", "is not a df2p", "is neither a df2p pack nor a gguf")
+
+
 def fallback_note(log_text: str) -> str:
-    """From one engine start's log: ``Drafting: MTP (DFlash2 didn't fit)`` when the engine fell back from DFlash2, else ``""``. The engine
-    names the reason in its own words; two are told apart: no room in graphics memory, and a mode this build does not support."""
+    """From one engine start's log: ``Drafting: MTP (<reason>)`` when the engine fell back from DFlash2, else ``""``. The engine names the
+    reason in its own words; three are told apart: a mode it does not run DFlash2 in, a drafter file it cannot open or read, and (any other
+    failure) no room in graphics memory."""
     text = str(log_text or "")
     if _ON.search(text):
         return ""
     if "--draft dflash2" not in text:
         return ""
     low = text.lower()
-    if "it is for one card and the cli run" in low or "needs a native pack" in low or "it needs --mtp" in low:
+    if any(words in low for words in _NOT_HERE_WORDS):
         reason = NOT_HERE
+    elif any(words in low for words in _NO_FILE_WORDS):
+        reason = NOT_DOWNLOADED
     else:
         reason = DIDNT_FIT
     return mtp_line(reason)

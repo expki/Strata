@@ -51,7 +51,8 @@ def _inputs(a) -> dict:
         if data is None:
             from strata_cli.launch.catalog import Catalog
             data = Catalog().data_dir()
-    return {"mode": a.mode if a.mode else cfg.get("drafting"), "klass": _card_class(), "model_name": cfg.get("model_name"), "family": a.family, "data_dir": data}
+    return {"mode": a.mode if a.mode else cfg.get("drafting"), "klass": _card_class(), "model_name": cfg.get("model_name"), "family": a.family, "data_dir": data,
+            "drafting_model": cfg.get("drafting_model")}
 
 
 def run(a) -> int:
@@ -61,7 +62,8 @@ def run(a) -> int:
     folder = want["data_dir"]
     needed = drafting.needs_pack(**want)
     if a.drafting_command == "plan":
-        decision = drafting.decide(want["mode"], klass=want["klass"], model_name=want["model_name"], family=want["family"], data_dir=folder)
+        decision = drafting.decide(want["mode"], klass=want["klass"], model_name=want["model_name"], family=want["family"], data_dir=folder,
+                                   drafting_model=want["drafting_model"])
         result = {**drafting_fetch.plan(folder), "needed": needed, "serves": drafting.ENGINE_SERVES_DFLASH2, "drafter": decision.drafter, "note": decision.note,
                   "line": drafting.summary_line(decision)}
         if (a.config or a.mode) and not needed:           # asked about a model: nothing to download unless the choice uses the drafter
