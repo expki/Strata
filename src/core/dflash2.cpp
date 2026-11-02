@@ -45,7 +45,7 @@ Dflash2Drafter::~Dflash2Drafter() {
     for (cudaGraphExec_t& e : exec_)
         if (e) cudaGraphExecDestroy(e);
     auto fr = [](void* p) { if (p) cudaFree(p); };
-    fr(blob_); fr(d_meta_); fr(xq_); fr(xqp_); fr(xdp_); fr(xqc_); fr(xdc_); fr(rt_ctx_); fr(rt_blk_);
+    fr(blob_); fr(win_stage_); fr(d_meta_); fr(xq_); fr(xqp_); fr(xdp_); fr(xqc_); fr(xdc_); fr(rt_ctx_); fr(rt_blk_);
     for (int l = 0; l < 8; ++l) { fr(kring_[l]); fr(vring_[l]); }
     fr(fcy_); fr(hctx_); fr(kc_); fr(vc_); fr(h_); fr(xn_); fr(xc_); fr(dyn_); fr(q_); fr(qn_); fr(k_); fr(v_); fr(kblk_); fr(ao_); fr(o_);
     fr(gate_); fr(up_); fr(mlp_); fr(part_); fr(fn_); fr(logits_); fr(topval_); fr(hsel_); fr(toptok_); fr(topscratch_);
@@ -216,6 +216,7 @@ bool Dflash2Drafter::alloc(std::string& err) {
               dev(&kblk_, B * NKV_ * HD_) && dev(&ao_, B * NH_ * HD_) && dev(&o_, B * N_) && dev(&gate_, B * I_) && dev(&up_, B * I_) && dev(&mlp_, B * N_) &&
               dev(&part_, (size_t) kernels::kDf2MaxChunks * 8 * 32 * 130) && dev(&fn_, B * N_) && dev(&topval_, kDrafts * 16) && dev(&toptok_, kDrafts * 16) &&
               dev(&hsel_, kDrafts * rank_) && dev(&topscratch_, (size_t) kDrafts * kernels::kDf2TopBlocks * kernels::kDf2TopK * 2);
+    ok = ok && dev(&win_stage_, (size_t) kWindow * NKV_ * HD_);
     for (int l = 0; ok && l < L_; ++l) ok = dev(&kring_[l], (size_t) kRing * NKV_ * HD_) && dev(&vring_[l], (size_t) kRing * NKV_ * HD_);
     if (!ok) { err = "dflash2: the drafter's buffers do not fit in VRAM"; return false; }
     void* hd = nullptr;
@@ -467,15 +468,95 @@ bool Dflash2Drafter::prepare(const float* taps, std::string& err) {
 bool Dflash2Drafter::context(const float* taps, int64_t n, int64_t pos0, std::string& err) {
     const OnDevice on_device(device_);
     const int tap_n = (int) taps_.size() * N_;
+    // every group runs on the one stream in order, so the positions are set on the device and the host waits once
     for (int64_t r0 = 0; r0 < n; r0 += kRows) {
         const int m = (int) std::min<int64_t>(kRows, n - r0);
-        for (int i = 0; i < m; ++i) h_meta_[i] = (int32_t) (pos0 + r0 + i);
-        std::atomic_thread_fence(std::memory_order_seq_cst);
-        kernels::copy_i32_from_mapped(d_meta_, m_meta_, 32, cs_);
-        if (!record_context(taps + (size_t) r0 * (size_t) tap_n, m, cs_, err)) return false;
-        if (cudaStreamSynchronize(cs_) != cudaSuccess) { err = std::string("dflash2: ") + cudaGetErrorString(cudaGetLastError()); return false; }
+        kernels::df2_set_pos(d_meta_, pos0 + r0, m, cs_);
+        if (!record_context(taps + (size_t) r0 * (size_t) tap_n, m, cs_, err)) { cudaStreamSynchronize(cs_); return false; }
     }
+    if (cudaStreamSynchronize(cs_) != cudaSuccess) { err = std::string("dflash2: ") + cudaGetErrorString(cudaGetLastError()); return false; }
     have_ctx_ = std::max<int64_t>(have_ctx_, pos0 + n);
+    return true;
+}
+
+namespace {
+
+// the saved window: this header, then per layer the K plane and the V plane, each [row][head][128] FP16
+struct WindowHeader {
+    uint32_t magic;
+    uint32_t version;
+    int64_t upto;
+    int32_t rows, layers, heads, head_dim;
+};
+constexpr uint32_t kWindowMagic = 0x57324644;   // "DF2W"
+
+}  // namespace
+
+size_t Dflash2Drafter::window_bytes(int64_t upto) const {
+    const int64_t rows = std::min<int64_t>(std::max<int64_t>(upto, 0), kWindow);
+    return sizeof(WindowHeader) + (size_t) rows * (size_t) L_ * 2 * (size_t) NKV_ * (size_t) HD_ * 2;
+}
+
+void Dflash2Drafter::clear_ring(int64_t upto) {
+    const OnDevice on_device(device_);
+    for (int l = 0; l < L_; ++l) {
+        cudaMemsetAsync(kring_[l], 0, (size_t) kRing * NKV_ * HD_ * 4, cs_);
+        cudaMemsetAsync(vring_[l], 0, (size_t) kRing * NKV_ * HD_ * 4, cs_);
+    }
+    cudaStreamSynchronize(cs_);
+    have_ctx_ = upto;
+}
+
+bool Dflash2Drafter::save_window(int64_t upto, std::vector<uint8_t>& out, std::string& err) {
+    if (upto < 0) { err = "dflash2: window position below 0"; return false; }
+    const OnDevice on_device(device_);
+    const int rows = (int) std::min<int64_t>(upto, kWindow);
+    const size_t plane = (size_t) rows * NKV_ * HD_ * 2;
+    out.resize(window_bytes(upto));
+    const WindowHeader h{kWindowMagic, 1, upto, rows, L_, NKV_, HD_};
+    std::memcpy(out.data(), &h, sizeof h);
+    uint8_t* at = out.data() + sizeof h;
+    try {
+        for (int l = 0; l < L_; ++l)
+            for (float* ring : {kring_[l], vring_[l]}) {
+                kernels::df2_ring_save(ring, win_stage_, kRing, upto - rows, rows, NKV_, cs_);
+                if (plane > 0 && cudaMemcpyAsync(at, win_stage_, plane, cudaMemcpyDeviceToHost, cs_) != cudaSuccess) { err = "dflash2: window copy"; return false; }
+                if (cudaStreamSynchronize(cs_) != cudaSuccess) { err = std::string("dflash2: window copy: ") + cudaGetErrorString(cudaGetLastError()); return false; }
+                at += plane;
+            }
+    } catch (const std::exception& e) {
+        err = e.what();
+        return false;
+    }
+    return true;
+}
+
+bool Dflash2Drafter::restore_window(const std::vector<uint8_t>& in, int64_t upto, std::string& err) {
+    WindowHeader h;
+    if (upto < 0 || in.size() < sizeof h) { err = "dflash2: the saved window is cut short"; return false; }
+    std::memcpy(&h, in.data(), sizeof h);
+    if (h.magic != kWindowMagic || h.version != 1) { err = "dflash2: not a saved window"; return false; }
+    if (h.upto != upto) { err = "dflash2: the window was saved at position " + std::to_string(h.upto) + ", not " + std::to_string(upto); return false; }
+    if (h.layers != L_ || h.heads != NKV_ || h.head_dim != HD_ || h.rows != (int32_t) std::min<int64_t>(upto, kWindow) || in.size() != window_bytes(upto)) {
+        err = "dflash2: the saved window has another layout";
+        return false;
+    }
+    const OnDevice on_device(device_);
+    const size_t plane = (size_t) h.rows * NKV_ * HD_ * 2;
+    const uint8_t* at = in.data() + sizeof h;
+    try {
+        for (int l = 0; l < L_; ++l)
+            for (float* ring : {kring_[l], vring_[l]}) {
+                if (plane > 0 && cudaMemcpyAsync(win_stage_, at, plane, cudaMemcpyHostToDevice, cs_) != cudaSuccess) { err = "dflash2: window copy"; return false; }
+                kernels::df2_ring_load(win_stage_, ring, kRing, upto - h.rows, h.rows, NKV_, cs_);
+                if (cudaStreamSynchronize(cs_) != cudaSuccess) { err = std::string("dflash2: window copy: ") + cudaGetErrorString(cudaGetLastError()); return false; }
+                at += plane;
+            }
+    } catch (const std::exception& e) {
+        err = e.what();
+        return false;
+    }
+    have_ctx_ = upto;
     return true;
 }
 

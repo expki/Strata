@@ -156,7 +156,6 @@ int main(int argc, char** argv) {
         expect(!d.restore_window(w, n_ctx, err), "(c) restore_window at another upto is refused");
         std::printf("  refusal: %s\n", err.c_str());
         expect(d.restore_window(w, up, err), "(b) restore_window");
-        if (!err.empty()) std::printf("  err: %s\n", err.c_str());
         if (!draft(d, t1, up, up, B)) return 1;
         same(A, B, "(b) restored drafts equal the live ring's");
         expect(w.size() == d.window_bytes(up), "(d) w.size() == window_bytes(n_ctx - 1)");

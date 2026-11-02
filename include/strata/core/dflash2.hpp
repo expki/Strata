@@ -35,6 +35,7 @@ class Dflash2Drafter {
 public:
     static constexpr int kRows = 8;           ///< block rows: the anchor + 7 masks
     static constexpr int kDrafts = kRows - 1;
+    static constexpr int kWindow = 2048;      ///< positions the window saves, the attention's reach
     static constexpr int kRing = 2064;        ///< K/V slots per layer: the 2048 window + slack for rows written ahead of a rejection
 
     Dflash2Drafter() = default;
@@ -52,6 +53,14 @@ public:
 
     /// A new request: the ring is empty again.
     void reset() { have_ctx_ = 0; }
+    /// The ring is zeroed and the context starts at `upto` (no stale row is left to read).
+    void clear_ring(int64_t upto);
+    /// Size of save_window(upto): the header + min(upto, kWindow) rows x layers x (K, V) x NKV x HD x 2 bytes.
+    size_t window_bytes(int64_t upto) const;
+    /// The FP16 keys and values of positions [max(0, upto - kWindow), upto) in `out`, for restore_window.
+    bool save_window(int64_t upto, std::vector<uint8_t>& out, std::string& err);
+    /// Writes a saved window back to the ring and the context ends at `upto`.  False (the ring untouched) if `in` was saved at another `upto` or on another layout.
+    bool restore_window(const std::vector<uint8_t>& in, int64_t upto, std::string& err);
     /// Context rows without a draft: `n` rows of taps (device, [n][5 * n_embd]) for positions pos0 ... pos0 + n - 1.
     bool context(const float* taps_dev, int64_t n, int64_t pos0, std::string& err);
     /// One round: the new context rows (n_new in 1..8: the committed window rows, taps device [n_new][5 * n_embd], positions pos0 ...),
@@ -132,6 +141,7 @@ private:
     float *logits_ = nullptr, *topval_ = nullptr, *hsel_ = nullptr, *out_prob_ = nullptr;
     int32_t *toptok_ = nullptr, *out_tok_ = nullptr;
     uint32_t* topscratch_ = nullptr;
+    uint16_t* win_stage_ = nullptr; ///< one K or V plane of the window as FP16, between the ring and the host
     cudaGraphExec_t exec_[kRows + 1] = {};
     const float* graph_taps_ = nullptr;
     int64_t have_ctx_ = 0;
