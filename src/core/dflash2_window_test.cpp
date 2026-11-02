@@ -70,6 +70,9 @@ struct Answer {
     float prob[7];
 };
 
+// FP16 rounding of a correct save leaves the final rows at cosine 0.9978 or more (4 runs), a save one row off falls far below this
+constexpr double kMinCos = 0.99;
+
 int g_bad = 0;
 void expect(bool ok, const char* what) {
     std::printf("%s: %s\n", ok ? "ok  " : "FAIL", what);
@@ -99,6 +102,8 @@ void info(const Answer& a, const Answer& b, const char* what) {
     }
     std::printf("info: %s (tokens equal %d of 7, max |dp| %.2e)\n", what, eq, dp);
 }
+
+bool tokens_equal(const Answer& a, const Answer& b) { return std::equal(a.tok, a.tok + 7, b.tok); }
 
 double min_cosine(const std::vector<float>& a, const std::vector<float>& b) {
     double lo = 1.0;
@@ -161,6 +166,7 @@ int main(int argc, char** argv) {
     Dev t1(randn((size_t) n_ctx * TAPN, 1, 1.0f)), t2(randn((size_t) 300 * TAPN, 2, 1.0f));
     Answer A{}, A2{}, B{};
     std::vector<uint8_t> w;
+    double cos_round = 0;
     {   // (a) the live ring
         Dflash2Drafter d;
         if (!open(d) || !context(d, t1, 0, up, 0)) return 1;
@@ -172,7 +178,11 @@ int main(int argc, char** argv) {
         // the same ring rounded to FP16 by a restore in place: the exact reference for (b)
         if (!d.restore_window(w, up, err) || !draft(d, t1, up, up, A2)) { std::fprintf(stderr, "restore in place: %s\n", err.c_str()); return 1; }
         d.debug_rows(rows_round, err);
-        std::printf("info: final rows of the live ring and of the ring rounded to FP16: min cosine %.7f\n", min_cosine(rows_live, rows_round));
+        cos_round = min_cosine(rows_live, rows_round);
+        std::printf("final rows of the live ring and of the ring restored from its own window: min cosine %.7f\n", cos_round);
+        expect(cos_round > kMinCos, "(a) the restored ring's final rows stay near the live ring's (a shifted save fails this)");
+        expect(!d.save_window(up + 2, w, err), "(a) save_window beyond the context held is refused");
+        std::printf("  refusal: %s\n", err.c_str());
     }
     {   // (b) a ring that moved on, then the restore; (c) the refusal; (d) the size
         Dflash2Drafter d;
@@ -180,19 +190,33 @@ int main(int argc, char** argv) {
         expect(!d.restore_window(w, n_ctx, err), "(c) restore_window at another upto is refused");
         std::printf("  refusal: %s\n", err.c_str());
         expect(d.restore_window(w, up, err), "(b) restore_window");
+        std::vector<uint8_t> w_again;
+        expect(d.save_window(up, w_again, err) && w_again == w, "(b) saving the restored ring gives the same bytes");
         if (!draft(d, t1, up, up, B)) return 1;
         info(A, B, "(b) restored drafts against the live FP32 ring");
         same(A2, B, "(b) restored drafts equal the live ring rounded to FP16 by a restore in place");
         expect(w.size() == d.window_bytes(up), "(d) w.size() == window_bytes(n_ctx - 1)");
         std::printf("  window %zu bytes for upto %lld, %zu bytes for upto 100\n", w.size(), (long long) up, d.window_bytes(100));
+        // (h) a restore ends the floor of a clear_ring
+        Answer B3{};
+        d.clear_ring(1000);
+        if (!d.restore_window(w, up, err) || !draft(d, t1, up, up, B3)) { std::fprintf(stderr, "restore after clear: %s\n", err.c_str()); return 1; }
+        same(B, B3, "(h) restore_window after clear_ring drafts as before (the floor is gone)");
     }
-    {   // (g) clear_ring leaves no stale row
-        Dflash2Drafter d;
-        Answer G{};
+    {   // (g) after clear_ring(1000) only rows written from 1000 on are read, as in a drafter whose context is those rows alone
+        Dflash2Drafter ref, d;
+        Answer R{}, G{};
+        std::vector<float> rows_ref, rows_g;
+        if (!open(ref) || !context(ref, t1, 0, 100, 0) || !draft(ref, t1, 100, 100, R)) return 1;
+        ref.debug_rows(rows_ref, err);
         if (!open(d) || !context(d, t2, 0, 300, 0)) return 1;
-        d.clear_ring(0);
-        if (!context(d, t1, 0, up, 0) || !draft(d, t1, up, up, G)) return 1;
-        same(A, G, "(g) clear_ring then the same context drafts like a fresh drafter");
+        d.clear_ring(1000);
+        if (!context(d, t1, 0, 100, 1000) || !draft(d, t1, 100, 1100, G)) return 1;
+        d.debug_rows(rows_g, err);
+        same(R, G, "(g) clear_ring(1000) then 100 rows: drafts like a context of those 100 rows alone");
+        const double cg = min_cosine(rows_ref, rows_g);
+        std::printf("  final rows min cosine %.7f\n", cg);
+        expect(cg > 0.9999, "(g) the final rows match (rope positions differ by 1000, so not bitwise)");
     }
     {   // (e) the ring wraps twice
         const int n = 5000;
@@ -220,6 +244,7 @@ int main(int argc, char** argv) {
         same(C, D, "(e) a wrapped ring drafts like a drafter that saw only the last 2048 rows");
         same(C2, E, "(e) a restored wrapped window drafts like the live ring rounded to FP16");
         info(C, E, "(e) restored drafts against the live FP32 ring");
+        expect(tokens_equal(C, E), "(e) a restored wrapped window gives the live ring's 7 tokens");
         expect(w3.size() == w.size(), "(e) the wrapped window has 2048 rows like the first");
         // (f) the time of 2047 context rows, cold then warm
         Dflash2Drafter d;

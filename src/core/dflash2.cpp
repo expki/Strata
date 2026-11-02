@@ -377,7 +377,7 @@ bool Dflash2Drafter::record_block(cudaStream_t cs, std::string& err) {
             if (!skip_part("small")) df2_norm_rope_qk(q_, k_, f32(p + "self_attn.q_norm.weight"), f32(p + "self_attn.k_norm.weight"), rt_blk_, qn_, kblk_, B, NH_, NKV_, eps_, cs);
             stamp("df2_norm_rope_qk");
             if (fork_) cudaStreamWaitEvent(cs, ev_ctx_[l], 0);   // the context update has written this layer's ring
-            if (!skip_part("attn")) df2_attention(qn_, kring_[l], vring_[l], kblk_, v_, d_meta_ + 17, kRing, window_, part_, xqp_, xdp_, cs);
+            if (!skip_part("attn")) df2_attention(qn_, kring_[l], vring_[l], kblk_, v_, d_meta_ + 17, d_meta_ + 18, kRing, window_, part_, xqp_, xdp_, cs);
             stamp("df2_attention");
             if (!skip_part("qkvo")) gemm({(p + "self_attn.o_proj.weight").c_str()}, {o_}, B, cs, xqp_, xdp_);
             stamp("gemm:o_proj");
@@ -469,10 +469,16 @@ bool Dflash2Drafter::context(const float* taps, int64_t n, int64_t pos0, std::st
     const OnDevice on_device(device_);
     const int tap_n = (int) taps_.size() * N_;
     // every group runs on the one stream in order, so the positions are set on the device and the host waits once
-    for (int64_t r0 = 0; r0 < n; r0 += kRows) {
-        const int m = (int) std::min<int64_t>(kRows, n - r0);
-        kernels::df2_set_pos(d_meta_, pos0 + r0, m, cs_);
-        if (!record_context(taps + (size_t) r0 * (size_t) tap_n, m, cs_, err)) { cudaStreamSynchronize(cs_); return false; }
+    try {
+        for (int64_t r0 = 0; r0 < n; r0 += kRows) {
+            const int m = (int) std::min<int64_t>(kRows, n - r0);
+            kernels::df2_set_pos(d_meta_, pos0 + r0, m, cs_);
+            if (!record_context(taps + (size_t) r0 * (size_t) tap_n, m, cs_, err)) { cudaStreamSynchronize(cs_); return false; }
+        }
+    } catch (const std::exception& e) {
+        cudaStreamSynchronize(cs_);
+        err = e.what();
+        return false;
     }
     if (cudaStreamSynchronize(cs_) != cudaSuccess) { err = std::string("dflash2: ") + cudaGetErrorString(cudaGetLastError()); return false; }
     have_ctx_ = std::max<int64_t>(have_ctx_, pos0 + n);
@@ -505,10 +511,12 @@ void Dflash2Drafter::clear_ring(int64_t upto) {
     }
     cudaStreamSynchronize(cs_);
     have_ctx_ = upto;
+    floor_ = upto;
 }
 
 bool Dflash2Drafter::save_window(int64_t upto, std::vector<uint8_t>& out, std::string& err) {
     if (upto < 0) { err = "dflash2: window position below 0"; return false; }
+    if (upto > have_ctx_) { err = "dflash2: the window position " + std::to_string(upto) + " is beyond the context held, " + std::to_string(have_ctx_); return false; }
     const OnDevice on_device(device_);
     const int rows = (int) std::min<int64_t>(upto, kWindow);
     const size_t plane = (size_t) rows * NKV_ * HD_ * 2;
@@ -557,6 +565,7 @@ bool Dflash2Drafter::restore_window(const std::vector<uint8_t>& in, int64_t upto
         return false;
     }
     have_ctx_ = upto;
+    floor_ = 0;
     return true;
 }
 
@@ -576,6 +585,7 @@ bool Dflash2Drafter::draft(const float* taps, int n_new, int64_t pos0, int32_t a
     for (int i = 0; i < 8; ++i) { h_meta_[i] = (int32_t) (pos0 + std::min(i, n_new - 1)); h_meta_[8 + i] = (int32_t) (s + i); }
     h_meta_[16] = anchor;
     h_meta_[17] = (int32_t) s;
+    h_meta_[18] = (int32_t) floor_;
     h_meta_[24] = anchor;
     for (int i = 1; i < 8; ++i) h_meta_[24 + i] = mask_token_;
     for (int i = 0; i < kDrafts; ++i) { ((volatile int32_t*) h_out_)[i] = -1; }

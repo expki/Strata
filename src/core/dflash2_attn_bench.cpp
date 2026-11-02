@@ -41,10 +41,10 @@ int main(int argc, char** argv) {
     cudaEventCreate(&b);
     for (int v : {0, 1, 2, 3}) {
         df2_attention_variant(v);
-        df2_attention(q, kr, vr, kb, vb, pos, ring, 2048, part, out, xdb, nullptr);
+        df2_attention(q, kr, vr, kb, vb, pos, nullptr, ring, 2048, part, out, xdb, nullptr);
         cudaDeviceSynchronize();
         cudaEventRecord(a);
-        for (int i = 0; i < iters; ++i) df2_attention(q, kr, vr, kb, vb, pos, ring, 2048, part, out, xdb, nullptr);
+        for (int i = 0; i < iters; ++i) df2_attention(q, kr, vr, kb, vb, pos, nullptr, ring, 2048, part, out, xdb, nullptr);
         cudaEventRecord(b);
         cudaEventSynchronize(b);
         float ms;

@@ -100,7 +100,7 @@ constexpr int AS = 132;   // smem row stride of the Q / K / V tiles (float4 alig
 constexpr int PS = 36;    // stride of the transposed probabilities P[key][query]
 __global__ void __launch_bounds__(128) attn_part_kernel(const float* __restrict__ q, const float* __restrict__ kring, const float* __restrict__ vring,
                                                        const float* __restrict__ kblk, const float* __restrict__ vblk,
-                                                       const int32_t* __restrict__ anchor_pos, int ring_slots, int window, float* __restrict__ part, int variant) {
+                                                       const int32_t* __restrict__ anchor_pos, const int32_t* __restrict__ floor_pos, int ring_slots, int window, float* __restrict__ part, int variant) {
     __shared__ __align__(16) float Qs[32 * AS];
     __shared__ __align__(16) float Ks[32 * AS];   // the K tile, then the V tile
     __shared__ __align__(16) float Ps[32 * PS];
@@ -108,8 +108,9 @@ __global__ void __launch_bounds__(128) attn_part_kernel(const float* __restrict_
     __shared__ float m_s[32], l_s[32], corr_s[32];
     const int kvh = blockIdx.x, chunk = blockIdx.y, tid = threadIdx.x;
     const int s = *anchor_pos;
-    const int lo = s - (window - 1) > 0 ? s - (window - 1) : 0;
-    const int nctx = s - lo;
+    const int fl = floor_pos ? *floor_pos : 0;
+    const int lo = max(fl, s - (window - 1));
+    const int nctx = max(s - lo, 0);
     const int nkeys = nctx + kDf2Rows;
     const int k_begin = chunk * kDf2Chunk;
     float* const pbase = part + (((size_t) chunk * kDf2Kv + kvh) * 32) * 130;
@@ -699,8 +700,8 @@ void df2_copy_rows(const float* in, float* out, const int32_t* pos, int slot_mod
 }
 
 void df2_attention(const float* q, const float* kring, const float* vring, const float* kblk, const float* vblk, const int32_t* anchor_pos,
-                   int ring_slots, int window, float* part, void* xq, float* xd, void* stream) {
-    attn_part_kernel<<<dim3(kDf2Kv, kDf2MaxChunks), 128, 0, (cudaStream_t) stream>>>(q, kring, vring, kblk, vblk, anchor_pos, ring_slots, window, part, g_attn_variant);
+                   const int32_t* floor_pos, int ring_slots, int window, float* part, void* xq, float* xd, void* stream) {
+    attn_part_kernel<<<dim3(kDf2Kv, kDf2MaxChunks), 128, 0, (cudaStream_t) stream>>>(q, kring, vring, kblk, vblk, anchor_pos, floor_pos, ring_slots, window, part, g_attn_variant);
     check("attn_part");
     attn_merge_kernel<<<kDf2Kv * 32, HD, 0, (cudaStream_t) stream>>>(part, static_cast<int8_t*>(xq), xd);
     check("attn_merge");

@@ -75,7 +75,7 @@ int main(int argc, char** argv) {
     time("topk (7 x 106299)", [&] { df2_topk(lg, 106299, nullptr, 7, reinterpret_cast<uint32_t*>(scr), tv, tok, nullptr); });
     time("select (7 rows)", [&] { df2_select(hp, tv, tok, cb, cb, 256, 7, tok, outt, outp, nullptr); });
     time("conv (resid)", [&] { df2_conv(o, dyn, 640, base, h, h, B, N, 16, nullptr); });
-    time("attention merge+quant only", [&] { df2_attention(q, kr, vr, kr, vr, pos, 2064, 2048, part, xq, xd, nullptr); });
+    time("attention merge+quant only", [&] { df2_attention(q, kr, vr, kr, vr, pos, nullptr, 2064, 2048, part, xq, xd, nullptr); });
     Df2Mat m{w, y, 640};
     time("gemm 640 x 2560 (tiny)", [&] { df2_gemm(&m, 1, xq, xd, N, 8, nullptr); });
     return 0;
