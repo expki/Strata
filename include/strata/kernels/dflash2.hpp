@@ -76,6 +76,13 @@ void df2_norm_rope_qk(const float* q, const float* k, const float* gq, const flo
 void df2_kv_ring(const float* kin, const float* vin, const float* gk, const int32_t* pos, const float* table, float* kring, float* vring, int slots, int rows,
                  int heads, float eps, void* stream);
 
+/// The window copy: `rows` rows from position `start` of a head-major fp32 ring ([heads][slots][128], slot = position % slots) to `out`
+/// (fp16, [row][head][128]) and back.
+void df2_ring_save(const float* ring, void* out, int slots, int64_t start, int rows, int heads, void* stream);
+void df2_ring_load(const void* in, float* ring, int slots, int64_t start, int rows, int heads, void* stream);
+/// dst[i] = base + i for i < n <= 32 (the context rows' positions, set on the device so a batch of groups needs no host staging).
+void df2_set_pos(int32_t* dst, int64_t base, int n, void* stream);
+
 /// Top-16 per row of logits [rows][n] (value-descending; ties to the lower index).  idx_map (optional) maps a column to a token id.
 /// scratch: rows * kDf2TopBlocks * 16 * 2 words.  Outputs val[rows][16] and tok[rows][16].  n <= 4096 * kDf2TopBlocks.
 void df2_topk(const float* logits, int n, const int32_t* idx_map, int rows, uint32_t* scratch, float* val, int32_t* tok, void* stream);

@@ -485,6 +485,19 @@ __global__ void kv_ring_kernel(const float* __restrict__ kin, const float* __res
     vring[at] = vin[((size_t) r * heads + h) * HD + d];
 }
 
+// the window copy: ring [head][slot][128] fp32 <-> plane [row][head][128] fp16, row i of the window is position start + i at slot (start + i) % slots
+__global__ void ring_save_kernel(const float* __restrict__ ring, uint16_t* __restrict__ out, int slots, int64_t start, int heads) {
+    const int i = blockIdx.x, h = blockIdx.y, d = threadIdx.x;
+    out[((size_t) i * heads + h) * HD + d] = __half_as_ushort(__float2half(ring[((size_t) h * slots + (size_t) ((start + i) % slots)) * HD + d]));
+}
+__global__ void ring_load_kernel(const uint16_t* __restrict__ in, float* __restrict__ ring, int slots, int64_t start, int heads) {
+    const int i = blockIdx.x, h = blockIdx.y, d = threadIdx.x;
+    ring[((size_t) h * slots + (size_t) ((start + i) % slots)) * HD + d] = __half2float(__ushort_as_half(in[((size_t) i * heads + h) * HD + d]));
+}
+__global__ void set_pos_kernel(int32_t* dst, int64_t base, int n) {
+    if (threadIdx.x < n) dst[threadIdx.x] = (int32_t) (base + threadIdx.x);
+}
+
 // silu(gate) * up then the planar quantization: grid (ceil(I / 32 / 8), rows), 256 threads
 __global__ void swiglu_quant_kernel(const float* __restrict__ gate, const float* __restrict__ up, int I, int8_t* __restrict__ xq, float* __restrict__ xd) {
     const int blk = blockIdx.x * 8 + (threadIdx.x >> 5), b = blockIdx.y, lane = threadIdx.x & 31;
@@ -710,6 +723,23 @@ void df2_kv_ring(const float* kin, const float* vin, const float* gk, const int3
                  int heads, float eps, void* stream) {
     kv_ring_kernel<<<dim3(rows, heads), HD, 0, (cudaStream_t) stream>>>(kin, vin, gk, pos, table, kring, vring, slots, heads, eps);
     check("kv_ring");
+}
+
+void df2_ring_save(const float* ring, void* out, int slots, int64_t start, int rows, int heads, void* stream) {
+    if (rows <= 0) return;
+    ring_save_kernel<<<dim3(rows, heads), HD, 0, (cudaStream_t) stream>>>(ring, (uint16_t*) out, slots, start, heads);
+    check("ring_save");
+}
+
+void df2_ring_load(const void* in, float* ring, int slots, int64_t start, int rows, int heads, void* stream) {
+    if (rows <= 0) return;
+    ring_load_kernel<<<dim3(rows, heads), HD, 0, (cudaStream_t) stream>>>((const uint16_t*) in, ring, slots, start, heads);
+    check("ring_load");
+}
+
+void df2_set_pos(int32_t* dst, int64_t base, int n, void* stream) {
+    set_pos_kernel<<<1, 32, 0, (cudaStream_t) stream>>>(dst, base, n);
+    check("set_pos");
 }
 
 void df2_gemm_variant(int v) { g_gemm_variant = v; }
