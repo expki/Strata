@@ -415,7 +415,7 @@
 - [ ] **Step 6: Run the restore checks on the box in a stint (Review Focus 1)**
 
   DFlash2 config, conversation cache on, greedy. Write the driver locally and `scp` it.
-  - **(a)** A 3-turn chat of about 6K tokens a turn. Expected: turn 2 and 3 logs show `window restored ... (image)`. Each turn's accept rate is within 10 points of the same text read fresh, which is a restart plus the whole conversation as one prompt.
+  - **(a)** A 3-turn chat of about 6K tokens a turn. Expected: turn 2 and 3 logs show `window restored ... (image)`. Record each turn's accept rate next to the same text read fresh (a restart plus the whole conversation as one prompt). This is recorded, not a gate: the window stays FP16 whatever it shows (user, 2026-11-02).
   - **(b)** Then a request that keeps turns 1 and 2 but replaces turn 3. Expected: `window restored ... (rewind)` and an answer identical to MTP mode's for the same request.
   - **(c)** A second conversation that shares turn 1's system prompt. Expected: `(borrow)` or `(rewind)` restored.
   - **(d)** Disk: `SAVE` and then `RESTORE` through the server's session API. Expected: `(disk)` restored.
