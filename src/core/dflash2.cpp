@@ -519,6 +519,10 @@ void Dflash2Drafter::clear_ring(int64_t upto) {
 bool Dflash2Drafter::save_window(int64_t upto, std::vector<uint8_t>& out, std::string& err) {
     if (upto < 0) { err = "dflash2: window position below 0"; return false; }
     if (upto > have_ctx_) { err = "dflash2: the window position " + std::to_string(upto) + " is beyond the context held, " + std::to_string(have_ctx_); return false; }
+    if (have_ctx_ > kRing && have_ctx_ - upto > kRing - kWindow) {
+        err = "dflash2: the ring wrote over the rows below " + std::to_string(upto) + " (its context ends at " + std::to_string(have_ctx_) + ")";
+        return false;
+    }
     const OnDevice on_device(device_);
     const int rows = (int) std::min<int64_t>(upto, kWindow);
     const size_t plane = (size_t) rows * NKV_ * HD_ * 2;

@@ -1,6 +1,7 @@
 // include/strata/program/serve_drafter.hpp - the serve loop's model drafter, MTP or DFlash2, behind one interface.
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
 #include <cstdio>
 #include <memory>
@@ -40,6 +41,8 @@ public:
         return true;
     }
     virtual void clear_window(int64_t /*upto*/) {}                           // drop the context, rows from upto on come next
+    virtual size_t window_max_bytes() const { return 0; }                    // a full saved window, 0 when it keeps none
+    virtual int64_t window_end() const { return -1; }                        // where its context rows end, -1 without a window
     virtual void report(FILE* f) const = 0;                                  // rounds, ms a round, VRAM
 };
 

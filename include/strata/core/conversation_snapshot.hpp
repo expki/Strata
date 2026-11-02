@@ -183,5 +183,12 @@ ConversationRestore conversation_snapshot_restore(const SavedConversation& image
 ConversationRestore conversation_snapshot_restore_prefix(const SavedConversation& image, int64_t upto,
                                                           SessionState& session, const ModelGeometry& g,
                                                           const QsaState* draft, std::string& error);
+// Disk sessions without the draft layer's K/V too (a DFlash2 drafter keeps its window in the checkpoints instead)
+bool conversation_snapshot_sources(SavedConversation& meta, std::vector<SessionKvSource>& sources,
+                                   const ConversationView& view, const SessionState& session,
+                                   const ModelGeometry& g, const QsaState* draft, std::string& error);
+bool conversation_session_read_limits(SessionReadLimits& limits, const SessionState& session, const ModelGeometry& g,
+                                      const QsaState* draft, uint64_t max_tokens, uint64_t max_checkpoints,
+                                      std::string& error);
 
 } // namespace strata::core

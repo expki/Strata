@@ -779,6 +779,9 @@ curl -X POST "http://127.0.0.1:8080/slots/0?action=restore" -H "Content-Type: ap
   RAM accounting to catch up. It trades later prefix-cache hits for room to save and cannot guarantee a save.
 - Clients still send their messages and images; the file holds engine state and token identity, not a chat export. A follow-up
   that continues the restored conversation reuses its state; a short tail may be read again. Only the deepest checkpoint is saved.
+- With `--draft dflash2` the file also holds the drafter's last 2048 positions (FP16, about 42 MB) for the live state and the
+  saved checkpoint, so drafting goes on with its context after a restore. Format version 2 added them: a file of version 1 is
+  refused.
 - A file is bound to the model files (sampled by size and first and last MiB, not by path) and to the settings that change what
   the cells mean (engine version, CUDA or HIP, `--kv`, `STRATA_KV_ROT`, `--kv-resident`, `--max-context`, `--mtp-window`, the
   rope configuration, a loaded control vector and the arithmetic switches). Sampling, seeds, draft tuning and the expert

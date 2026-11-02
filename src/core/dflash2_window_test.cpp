@@ -187,6 +187,11 @@ int main(int argc, char** argv) {
     {   // (b) a ring that moved on, then the restore; (c) the refusal; (d) the size
         Dflash2Drafter d;
         if (!open(d) || !context(d, t1, 0, up, 0) || !context(d, t2, 0, 300, up)) return 1;
+        std::vector<uint8_t> w_old;
+        expect(!d.save_window(up, w_old, err), "(k) a save below rows the ring wrote over is refused");
+        std::printf("  refusal: %s\n", err.c_str());
+        expect(d.save_window(up + 300 - (Dflash2Drafter::kRing - Dflash2Drafter::kWindow), w_old, err),
+               "(k) a save the ring still holds whole is taken");
         expect(!d.restore_window(w, n_ctx, err), "(c) restore_window at another upto is refused");
         std::printf("  refusal: %s\n", err.c_str());
         expect(d.restore_window(w, up, err), "(b) restore_window");

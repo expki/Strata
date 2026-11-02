@@ -57,7 +57,7 @@ public:
     void clear_ring(int64_t upto);
     /// Size of save_window(upto): the header + min(upto, kWindow) rows x layers x (K, V) x NKV x HD x 2 bytes.
     size_t window_bytes(int64_t upto) const;
-    /// The FP16 keys and values of positions [max(0, upto - kWindow), upto) in `out`, for restore_window.  False if `upto` is beyond the context held.
+    /// The FP16 keys and values of positions [max(0, upto - kWindow), upto) in `out`, for restore_window.  False if `upto` is beyond the context held or the ring wrote over those rows.
     bool save_window(int64_t upto, std::vector<uint8_t>& out, std::string& err);
     /// Writes a saved window and its floor back so the context ends at `upto`, false with the ring untouched on another `upto` or layout.
     /// A device failure part way leaves the ring partly overwritten, so the caller must clear_ring or restore again.
@@ -72,6 +72,7 @@ public:
     /// Captures the eight round graphs (n_new = 1..8) on `taps` now, so no round pays for a capture.
     bool prepare(const float* taps_dev, std::string& err);
 
+    int64_t context_end() const { return have_ctx_; }   ///< the context rows end here
     uint64_t vram_bytes() const { return vram_; }
     int64_t n_draft_vocab() const { return n_dvocab_; }
     int n_embd() const { return N_; }

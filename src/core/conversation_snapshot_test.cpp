@@ -191,6 +191,25 @@ void full_session(int fmt, int mode, int experts) {
               x.checkpoints.size()==y.checkpoints.size() && equal(x.kv[0],y.kv[0]) && equal(x.kv.back(),y.kv.back()),
               "streamed file equals captured file");
         check(slurp(p1)==slurp(p2),"streamed file is byte-identical to the captured file");
+        {   // a DFlash2 engine saves and reads its session files without the MTP draft layer
+            SavedConversation m0;
+            std::vector<SessionKvSource> s0;
+            check(conversation_snapshot_sources(m0,s0,view,ss,g,nullptr,err) && s0.size()+1==sources.size(),
+                  "disk-save sources without a draft layer");
+            const std::string p3=(dir/"nodraft.bin").string();
+            size_t n3=0;
+            check(session_file_write(p3,m0,s0,id,n3,err),"session write without a draft layer");
+            SessionReadLimits l0, l1;
+            check(conversation_session_read_limits(l0,ss,g,nullptr,1u<<20,4,err) &&
+                  conversation_session_read_limits(l1,ss,g,draft.state,1u<<20,4,err) &&
+                  l0.max_kv_layers+1==l1.max_kv_layers,"read limits without a draft layer");
+            l0.max_drafter_bytes=0;
+            SavedConversation z;
+            const QsaState* no_draft=nullptr;
+            check(session_file_read(p3,id,z,n3,err,l0) && z.kv.size()==s0.size() &&
+                  conversation_snapshot_validate(z,ss,g,no_draft,err),"a file without a draft layer reads and validates");
+            check(!session_file_read(p1,id,z,n1,err,l0),"a file with the draft layer is refused by those limits");
+        }
         std::error_code ec;
         fs::remove_all(dir,ec);
         auto empty_ids=std::vector<int32_t>{};

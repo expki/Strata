@@ -745,5 +745,18 @@ int main() {
         check(cache.drop_superseded(slot_ids, {}, slot_chain, true) == 1 && cache.size() == 0,
               "the slot's chain supersedes the richer copy");
     }
+    {
+        // the DFlash2 window rides in every checkpoint and is charged to the cache
+        ConversationCheckpoint c;
+        c.ids = {1, 2, 3};
+        c.gdn.resize(64, 7);
+        const size_t without = c.bytes();
+        c.drafter.resize(42u << 20);
+        check(c.bytes() >= without + (42u << 20), "a checkpoint counts its drafter window");
+        SavedConversation s = image({1, 2, 3});
+        const size_t plain = s.bytes();
+        s.live.drafter.resize(1u << 20);
+        check(s.bytes() >= plain + (1u << 20), "a saved conversation counts the live drafter window");
+    }
     std::printf("conversation_cache_test: %d checks passed\n", checks);
 }

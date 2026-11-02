@@ -2995,6 +2995,18 @@ class CancelledRead(unittest.TestCase):
                                     "experts_streamed=0 amd_tier=2")
         self.assertEqual((e.last["chunk"], e.last["amd_tier"], e.last["offloaded"]), (1536, 2, 2))
 
+    def test_parse_done_dflash2_windows(self):
+        """--draft dflash2: the saved windows restored and missed since the start reach the engine facts."""
+        e = SimpleNamespace(info={"drafting": "dflash2"})
+        StrataEngine._parse_done(e, "DONE 5 12000 900.0 80.0 stop 3 4 0 7 9 0 0 0.0 12000 2 chunk=1536 "
+                                    "experts_streamed=0 df2_windows_restored=4 df2_windows_missing=1")
+        self.assertEqual((e.last["df2_windows_restored"], e.last["df2_windows_missing"]), (4, 1))
+        self.assertEqual((e.info["df2_windows_restored"], e.info["df2_windows_missing"]), (4, 1))
+        e = SimpleNamespace(info={})
+        StrataEngine._parse_done(e, "DONE 5 12000 900.0 80.0 stop 3 4 0 7 9 0 0 0.0 12000 2 chunk=1536 "
+                                    "experts_streamed=0")
+        self.assertNotIn("df2_windows_restored", e.info)
+
     def test_request_stats_chunk_fields(self):
         """Across a request's continuations the streamed blobs add up; the chunk is the request's own read's."""
         stats = request_stats([{"prompt_ms": 10.0, "chunk": 1536, "experts_streamed": 100},

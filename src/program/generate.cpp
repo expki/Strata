@@ -10724,6 +10724,29 @@ int main(int argc, char** argv) {
         std::vector<int32_t> live;
         std::vector<ImgKey> live_imgs, req_imgs;
         bool live_ok = false;
+        // DFlash2: the drafter's saved window rides in every checkpoint and park image (empty for MTP)
+        const bool df2_windows = serve_drafter && serve_drafter->window_max_bytes() > 0;
+        int64_t df2_windows_restored = 0, df2_windows_missing = 0;   // since the start, on the DONE line
+        // the window that ends at `at`, or an empty one when the drafter cannot give it (logged, the restore then misses)
+        auto df2_save = [&](int64_t at, std::vector<uint8_t>& out) {
+            out.clear();
+            if (!df2_windows) return;
+            std::string werr;
+            if (!serve_drafter->save_window(at, out, werr)) {
+                out.clear();
+                std::fprintf(stderr, "strata serve: dflash2: window not saved at %lld: %s\n", (long long) at, werr.c_str());
+            }
+        };
+        // a restore at `at`: the saved window when it matches, else an empty ring from `at` on (never rows past it)
+        auto df2_restore = [&](const std::vector<uint8_t>* win, int64_t at, const char* kind) {
+            if (!df2_windows) return;
+            std::string werr = win == nullptr || win->empty() ? "none saved" : "";
+            const bool ok = werr.empty() && serve_drafter->restore_window(*win, at, kind, werr);
+            if (!ok) serve_drafter->clear_window(at);
+            ++(ok ? df2_windows_restored : df2_windows_missing);
+            std::fprintf(stderr, "strata serve: dflash2: window %s at %lld (%s)%s%s\n", ok ? "restored" : "missing",
+                         (long long) at, kind, ok ? "" : ": ", ok ? "" : werr.c_str());
+        };
         // #879: a window met non-finite logits: the next request drops every cached state first and reads from token 0
         bool nan_flush = false;
         // #3465: the non-finite logits came in a window that reads the PROMPT's tail (the last few tokens, read through
@@ -10807,6 +10830,8 @@ int main(int argc, char** argv) {
                     for (const char* n : {"dense.txt", "experts.bin"}) files.push_back({std::string("mtp ") + n, o.mtp + "/" + n});
                     files.push_back({"mtp draft_vocab.bin", o.mtp + "/draft_vocab.bin", true});
                 }
+                // the saved drafter windows are this drafter's keys and values
+                if (df2_windows) files.push_back({"dflash2 drafter", o.draft_model});
                 uint64_t fp = 0;
                 // each file is one blocking read of at most 2 MiB (head and tail): announced before it starts
                 if (next_file) next_file();
@@ -10988,6 +11013,7 @@ int main(int argc, char** argv) {
                 err.clear();
             }
             estimate += stage_estimate;
+            if (df2_windows && src.with_reuse) estimate += serve_drafter->window_max_bytes();   // the live window
             // A park carrying its own retained K/V replaces memory the cache
             // already held, so capacity is make_room's call - it runs next either
             // way, and put()'s accounting still bounds the budget. The with-reuse
@@ -11060,6 +11086,7 @@ int main(int argc, char** argv) {
                         moved.empty() ? nullptr : &moved);
                 for (ConvCheckpoint& c : storage) ckpt_pool.give(std::move(c));
                 if (!saved) return false;
+                if (src.with_reuse) df2_save((int64_t) src.ids.size(), image.live.drafter);   // the drafter follows the main session only
                 pool_topup();   // what the park took (and what moved out) is allocated again, in the background
                 for (size_t k = 0; k < n_st; ++k) {   // the later stages (the last one with the draft layer's K/V)
                     auto& st = stages[k];
@@ -11281,6 +11308,7 @@ int main(int argc, char** argv) {
                                  (long long) L, sync_ms, save_ms, stages.size() + 1);
                 }
             }
+            df2_save(L, c.drafter);   // the drafter's context ends at L here too
             c.used = ++check_clock;
             if (seg_plan.chunk > 0 && L > seg_plan.from && L < seg_plan.to) c.plan = seg_plan;   // inside a planned segment
             if (as_tail) {   // only one tail checkpoint stays alive: the previous request's goes
@@ -13969,10 +13997,11 @@ int main(int argc, char** argv) {
                                 const uint64_t per = (uint64_t) z.tail + z.dead + z.block_pos;
                                 if (q == 0 || per <= (UINT64_MAX - z.gdn - z.ple) / q) state = z.gdn + z.ple + q * per;
                             }
+                            if (state != UINT64_MAX && df2_windows) state += serve_drafter->window_max_bytes();   // the live window
                             sl.state_bytes = state;
                             sl.tokens = live.size();
                             sl.images = live_imgs.size();
-                            sl.kv_layers = (uint64_t) std::max<int64_t>(ss.qsa_alloc, 0) + 1;
+                            sl.kv_layers = (uint64_t) std::max<int64_t>(ss.qsa_alloc, 0) + (mtp_kv() ? 1 : 0);
                         }
                         const uint64_t floor = (uint64_t) o.conversation_cache_min_free_mib << 20;
                         if (o.session_save_reclaim) {
@@ -14010,11 +14039,11 @@ int main(int argc, char** argv) {
                         std::vector<strata::core::SessionKvSource> sources;
                         // the live running state comes off the device in one synchronous copy
                         blocking("capture", sl.state_bytes == UINT64_MAX ? 0 : sl.state_bytes);
-                        if (!strata::core::conversation_snapshot_sources(meta, sources, view, ss, g, mtp.kv_state(),
-                                                                         err)) {
+                        if (!strata::core::conversation_snapshot_sources(meta, sources, view, ss, g, mtp_kv(), err)) {
                             refuse(err, strata::core::SessionError::io);
                             continue;
                         }
+                        df2_save((int64_t) live.size(), meta.live.drafter);
                         capture_ms = ms();
                         strata::core::SessionWriteOptions wo;
                         wo.min_free_bytes = (uint64_t) o.session_min_free_mib << 20;
@@ -14055,8 +14084,9 @@ int main(int argc, char** argv) {
                                   ram_note(mem) + ")";
                             return false;
                         };
+                        limits.max_drafter_bytes = df2_windows ? serve_drafter->window_max_bytes() : 0;
                         if (!strata::core::conversation_session_read_limits(
-                                limits, ss, g, mtp.kv_state(), (uint64_t) o.max_context,
+                                limits, ss, g, mtp_kv(), (uint64_t) o.max_context,
                                 (uint64_t) std::max(o.prompt_cache, 1), err)) {
                             refuse(err, strata::core::SessionError::io);
                             continue;
@@ -14073,7 +14103,7 @@ int main(int argc, char** argv) {
                     const double read_ms = ms();
                     // the whole image against this engine, still without any device write
                     blocking("validate", bytes);
-                    if (!strata::core::conversation_snapshot_validate(image, ss, g, mtp.kv_state(), err)) {
+                    if (!strata::core::conversation_snapshot_validate(image, ss, g, mtp_kv(), err)) {
                         refuse(err);
                         continue;
                     }
@@ -14086,7 +14116,7 @@ int main(int argc, char** argv) {
                     live_ok = false;
                     // host -> device in synchronous copies of the whole state: one bounded allowance
                     blocking("transfer", bytes);
-                    if (strata::core::conversation_snapshot_restore(image, ss, g, mtp.kv_state(), err) !=
+                    if (strata::core::conversation_snapshot_restore(image, ss, g, mtp_kv(), err) !=
                         strata::core::ConversationRestore::restored) {
                         // validated above: a failure here is a transfer failure, after device writes began - never
                         // decode from a partial state; the server starts the engine again
@@ -14097,6 +14127,7 @@ int main(int argc, char** argv) {
                         std::fflush(stdout);
                         return 1;
                     }
+                    df2_restore(&image.live.drafter, (int64_t) image.live.ids.size(), "disk");
                     live = std::move(image.live.ids);
                     live_imgs = std::move(image.live.imgs);
                     checks = std::move(image.checkpoints);
@@ -14449,6 +14480,9 @@ int main(int argc, char** argv) {
             }
             int64_t resume = 0;
             bool from_live = false;
+            // DFlash2: what a mounted checkpoint came from, and whether the window at resume is settled already
+            const char* df2_kind = "rewind";
+            bool df2_done = false;
             if (o.prompt_cache > 0 && want_cvec == cvec_cached) {
                 if (live_ok && starts_with(live, live_imgs)) { resume = (int64_t) live.size(); from_live = true; }
                 for (const ConvCheckpoint& c : checks)
@@ -14773,6 +14807,8 @@ int main(int argc, char** argv) {
                     live_imgs.clear();
                     resume = slot_tokens;
                     from_live = true;
+                    if (df2_windows) serve_drafter->clear_window(resume);   // (batch slots draft with MTP only)
+                    df2_done = true;
                     std::fprintf(stderr, "strata batch: slot %d gave back %lld tokens of this conversation (%s) in "
                                  "%.1f ms\n", slot_source, (long long) slot_tokens,
                                  slot_ck != nullptr ? "its turn checkpoint" : "all it holds",
@@ -14809,6 +14845,7 @@ int main(int argc, char** argv) {
                 cvec_cached = donor->cvec;
                 resume = parked.tokens;
                 from_live = false;
+                df2_kind = "borrow";   // the donor's checkpoint at parked.tokens is mounted below
                 conversations.count_borrow();
                 std::fprintf(stderr, "strata serve: conversation cache: borrowed %lld tokens from a parked "
                              "conversation, which stays parked, in %.1f ms; parked=%zu bytes=%zu borrowed=%zu\n",
@@ -14849,6 +14886,11 @@ int main(int argc, char** argv) {
                                  (unsigned long long) draft_hash, (long long) draft_kv.cells,
                                  mtp.kv_state().kv_mode, "ram",
                                  (long long) (mtp.kv_state().n_slots * strata::kernels::qsa_real_shapes().page_size));
+                }
+                df2_kind = "image";
+                if (parked.live) {   // the image's live window here, a checkpoint of the image is mounted below
+                    df2_restore(&incoming->live.drafter, parked.tokens, "image");
+                    df2_done = true;
                 }
                 live = std::move(incoming->live.ids);
                 live_imgs = std::move(incoming->live.imgs);
@@ -14950,6 +14992,10 @@ int main(int argc, char** argv) {
                     std::printf("ERR restoring a conversation checkpoint failed\n");
                     return 1;
                 }
+                if (reread_to < 0) {   // (STRATA_CKPT_REREAD reads the window's rows again through the prompt taps)
+                    df2_restore(&c->drafter, resume, df2_kind);
+                    df2_done = true;
+                }
                 if (lent && lent_slot == admit_slot) {
                     // the slot this request continues in drops its checkpoints at the admission: this one moves back
                     // into the chain (and on into the slot then: moved_in)
@@ -14990,6 +15036,9 @@ int main(int argc, char** argv) {
             // KV streaming: the drafter's ring may hold cells past `resume` from a longer turn; the main layers'
             // host copies and slots are always current (every writer writes both), so they need nothing
             const int64_t read_from = reread_to > 0 ? 0 : resume;
+            // the live session goes on: the ring holds its rows when the last request ended where this one resumes
+            if (df2_windows && !df2_done && read_from > 0 && serve_drafter->window_end() != read_from)
+                df2_restore(nullptr, read_from, "live");
             if (serve_drafter && !serve_drafter->begin_request(read_from, n, err)) {
                 std::printf("ERR %s\n", err.c_str());
                 return 1;
@@ -17223,10 +17272,13 @@ int main(int argc, char** argv) {
                     serve_drafter->mtp()->set_draft_history(consumed.data(), (int64_t) consumed.size(), outv[(size_t) a]);
                 generation = {};   // a skipped or failed production must not expose an older q view
                 const GatedDraftLimit draft_limit(mtp, gated_proposal, S_mtp, p + a + 1, o.max_context);
-                bool drafted = !serve_drafter || eos || produced_n >= max_new;
-                // the last window's rows still reach the drafter, so its context ends where the session does
-                if (serve_drafter && drafted && !serve_drafter->window_rows(ver, a + 1, p, err)) drafted = false;
-                if (!drafted && gated_proposal) {   // MTP-only: the gated proposal reads the DraftResult only MtpDrafter fills
+                const bool finished = eos || produced_n >= max_new;
+                bool drafted = !serve_drafter || finished;
+                // a finished request gives the drafter its last rows and no draft, and a failure there ends it below
+                if (serve_drafter && finished && !serve_drafter->window_rows(ver, a + 1, p, err)) {
+                    drafted = false;
+                    err = "the drafter's last window: " + err;
+                } else if (!drafted && gated_proposal) {   // MTP-only: the gated proposal reads the DraftResult only MtpDrafter fills
                     drafted = serve_drafter->mtp()->draft(T, outv.data(), p, a, drafts.data(), err, dprob.data(),
                                                           (float) req_spec_min_p, nullptr, &generation);
                 } else if (!drafted) {
@@ -17537,6 +17589,7 @@ int main(int argc, char** argv) {
             //      batched segment, 0 when it read none; the expert blobs its prompt read copied host -> device on
             //      every stage - not the CPU share's, the stage helper's or a --peer-device peer's)
             //      amd_tier=<entries>   (--peer-device hip:N only: the AMD tier's part of [offloaded])
+            //      df2_windows_restored=<n> df2_windows_missing=<n>   (--draft dflash2 only: since the start)
             char chain_txt[128] = "";
             if (o.lookup_chain > 0)
                 std::snprintf(chain_txt, sizeof(chain_txt), " %lld %lld %lld %lld %lld", (long long) chain_ok,
@@ -17544,16 +17597,20 @@ int main(int argc, char** argv) {
             char tier_txt[40] = "";
             if (peer.foreign())
                 std::snprintf(tier_txt, sizeof(tier_txt), " amd_tier=%lld", (long long) (drive.d.peer_entries - peer0));
+            char df2_txt[96] = "";   // DFlash2 only: its saved windows restored and missed since the start
+            if (df2_windows)
+                std::snprintf(df2_txt, sizeof(df2_txt), " df2_windows_restored=%lld df2_windows_missing=%lld",
+                              (long long) df2_windows_restored, (long long) df2_windows_missing);
             if (yielded_at >= 0) std::printf("YIELDED %d %lld\n", yielded_slot, (long long) yielded_at);
             std::printf("DONE %lld %lld %.1f %.1f %s %lld %lld %lld %lld %lld %lld %lld %.1f %lld %lld%s chunk=%lld "
-                        "experts_streamed=%lld%s\n",
+                        "experts_streamed=%lld%s%s\n",
                         (long long) produced_n,
                         (long long) n, prompt_ms, decode_ms, finish, (long long) draft_accepted, (long long) draft_offered,
                         (long long) resume, (long long) req_hits, (long long) req_look,
                         (long long) (src.ram_reads() - ram0), (long long) (src.file_reads() - files0),
                         (double) (src.file_read_bytes() - file_bytes0) / 1e6, (long long) read_n,
                         (long long) req_offload, chain_txt, (long long) req_chunk,
-                        (long long) (sp.chain_experts_streamed() - streamed0), tier_txt);
+                        (long long) (sp.chain_experts_streamed() - streamed0), tier_txt, df2_txt);
             std::fflush(stdout);
             if (admit_slot >= 0) {   // --batch: BADM <slot> <1 = continues in the batch windows | 0 = done>
                 bool cont = !cancelled && produced_n == 1 && admit_max_new > 1 && std::strcmp(finish, "length") == 0 &&

@@ -57,8 +57,8 @@ public:
     int max_window() const override { return max_t_; }
 
     bool begin_request(int64_t resume, int64_t /*prompt_len*/, std::string& /*err*/) override {
-        // the ring holds no saved window yet, so a resumed request drafts from the rows it reads
-        d_.clear_ring(std::max<int64_t>(resume, 0));
+        // the caller restored or cleared the window at resume, a ring that ends elsewhere is never read
+        if (resume <= 0 || d_.context_end() != resume) d_.clear_ring(std::max<int64_t>(resume, 0));
         return true;
     }
 
@@ -95,6 +95,8 @@ public:
         return d_.restore_window(in, upto, err);
     }
     void clear_window(int64_t upto) override { d_.clear_ring(upto); }
+    size_t window_max_bytes() const override { return d_.window_bytes(core::Dflash2Drafter::kWindow); }
+    int64_t window_end() const override { return d_.context_end(); }
 
     void report(FILE* f) const override {
         if (d_.rounds > 0)

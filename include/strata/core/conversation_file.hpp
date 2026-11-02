@@ -1,10 +1,11 @@
 // On-disk persistence of a conversation's state (SavedConversation): one file holding the running state, the
 // checkpoints the caller passes (the engine passes only the deepest one), every QSA layer's authoritative K/V and
-// the draft layer's K/V.  Pure host code: no CUDA.  Format v1 and the fail-closed read order are in
+// the draft layer's K/V.  Pure host code: no CUDA.  Format v2 and the fail-closed read order are in
 // docs/DETAILS.md (Session files).
 //
-// Format v1 is little-endian, with fixed-width integers and IEEE-754 floats; a big-endian build is refused at
+// Format v2 is little-endian, with fixed-width integers and IEEE-754 floats; a big-endian build is refused at
 // compile time.  The hashes detect accidental corruption; they do not authenticate a file: restore trusted files only.
+// Version 2 added a DFlash2 drafter window to every checkpoint.
 #pragma once
 
 #include "strata/core/conversation_cache.hpp"
@@ -215,6 +216,8 @@ struct SessionReadLimits {
     std::optional<std::pair<int64_t, int64_t>> layer_range;
     // the most bytes of each running-state array (gdn, ple, tails, dead, block_pos), live and per checkpoint
     std::array<uint64_t, 5> max_state_bytes{UINT64_MAX, UINT64_MAX, UINT64_MAX, UINT64_MAX, UINT64_MAX};
+    // the most bytes of a DFlash2 drafter window, live and per checkpoint (0: this engine drafts without one)
+    uint64_t max_drafter_bytes = UINT64_MAX;
     // per K/V layer (the QSA layers, then the draft): the most bytes of each part (k, v, k_scale, v_scale, pooled).
     // A layer past the end of the list is bounded by the payload only.
     std::vector<std::array<uint64_t, 5>> max_kv_bytes;

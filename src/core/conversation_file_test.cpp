@@ -93,13 +93,14 @@ SavedConversation sample() {
     return s;
 }
 
-// format v1 golden: the file the fixed sample() gives (size and session_hash64 of all bytes, seed 0)
-constexpr size_t kGoldenSize = 17878535;
-constexpr uint64_t kGoldenHash = 0x70f812b350360d09ull;
+// format v2 golden: the file the fixed sample() gives (size and session_hash64 of all bytes, seed 0)
+constexpr size_t kGoldenSize = 17878559;
+constexpr uint64_t kGoldenHash = 0x21ff90ba060641a9ull;
 
 bool same_checkpoint(const ConversationCheckpoint& a, const ConversationCheckpoint& b) {
     return a.ids == b.ids && a.imgs == b.imgs && a.gdn == b.gdn && a.ple == b.ple && a.tails == b.tails &&
-           a.dead == b.dead && a.block_pos == b.block_pos && a.used == b.used && b.stage_parts.empty();
+           a.dead == b.dead && a.block_pos == b.block_pos && a.drafter == b.drafter && a.used == b.used &&
+           b.stage_parts.empty();
 }
 
 bool same(const SavedConversation& a, const SavedConversation& b) {
@@ -164,14 +165,14 @@ int main() {
     check(session_file_write(good.string(), original, id, written, error), "write succeeds");
     check(error.empty(), "write leaves no error");
 
-    // golden: format v1 is frozen. The fixed sample must give these exact bytes (little-endian header fields at
+    // golden: format v2 is frozen. The fixed sample must give these exact bytes (little-endian header fields at
     // fixed offsets, and a fixed hash of the whole file); a format change must bump the version and this test.
     {
         const std::vector<char> g = slurp(good);
         auto u32 = [&](size_t o) { uint32_t v = 0; for (int i = 3; i >= 0; --i) v = v << 8 | uint8_t(g[o + i]); return v; };
         auto u64 = [&](size_t o) { uint64_t v = 0; for (int i = 7; i >= 0; --i) v = v << 8 | uint8_t(g[o + i]); return v; };
         check(g.size() >= 80 && std::memcmp(g.data(), "STRSESS\x01", 8) == 0, "golden: magic");
-        check(u32(8) == 1 && u32(12) == 64, "golden: version 1, header 64 bytes (little-endian)");
+        check(u32(8) == 2 && u32(12) == 64, "golden: version 2, header 64 bytes (little-endian)");
         check(u64(16) == id.model && u64(24) == id.config, "golden: fingerprints at offsets 16 and 24");
         check(u64(32) == g.size() - 64 - 16, "golden: payload length at offset 32");
         check(u64(40) == 0 && u64(48) == 0, "golden: reserved fields are zero");
@@ -244,10 +245,37 @@ int main() {
     // wrong version: header field patched and header hash recomputed so only the version differs
     {
         auto d = image;
-        uint32_t v = 2; std::memcpy(d.data() + 8, &v, 4);
+        uint32_t v = 3; std::memcpy(d.data() + 8, &v, 4);
         const uint64_t h = session_hash64(d.data(), 56, 0); std::memcpy(d.data() + 56, &h, 8);
         const fs::path p = dir / "ver.bin"; spit(p, d);
         check(rejects(p, id, "version"), "unknown version rejected");
+    }
+    // a file from version 1 (no drafter windows) is refused, never read as version 2
+    {
+        auto d = image;
+        uint32_t v = 1; std::memcpy(d.data() + 8, &v, 4);
+        const uint64_t h = session_hash64(d.data(), 56, 0); std::memcpy(d.data() + 56, &h, 8);
+        const fs::path p = dir / "v1.bin"; spit(p, d);
+        check(rejects(p, id, "unsupported version 1"), "a version 1 file is refused");
+    }
+    // the DFlash2 windows of the deepest checkpoint and of the live state come back byte for byte
+    {
+        SavedConversation s = sample();
+        s.live.drafter = bytes_of(1u << 20, 9);
+        s.checkpoints.back().drafter = bytes_of(1u << 20, 11);
+        const fs::path p = dir / "drafter.bin";
+        check(session_file_write(p.string(), s, id, written, error), "write with drafter windows");
+        SavedConversation back;
+        size_t read = 0;
+        check(session_file_read(p.string(), id, back, read, error), "read with drafter windows");
+        check(back.live.drafter == s.live.drafter, "the live drafter window reads back equal");
+        check(back.checkpoints.back().drafter == s.checkpoints.back().drafter,
+              "the deepest checkpoint's drafter window reads back equal");
+        check(back.checkpoints.front().drafter.empty(), "a checkpoint without a window reads back without one");
+        check(same(s, back), "round trip with windows is identical");
+        SessionReadLimits tight;
+        tight.max_drafter_bytes = (1u << 20) - 1;
+        check(rejects(p, id, "count", tight), "a window over the drafter limit is refused");
     }
     // a corrupted element count with a recomputed payload hash must fail on bounds, not allocate
     {
@@ -477,6 +505,7 @@ int main() {
             l.geometry = original.geometry;
             l.layer_range = std::make_pair(original.layer_lo, original.layer_hi);
             l.max_state_bytes = {4099, 77, 301, 64, 8};
+            l.max_drafter_bytes = 0;
             for (const auto& k : original.kv)
                 l.max_kv_bytes.push_back({k.k.size(), k.v.size(), k.k_scale.size(), k.v_scale.size(), k.pooled.size()});
             return l;
@@ -488,6 +517,13 @@ int main() {
         check(session_read_max_file_bytes(exact()) >= image.size() &&
               session_read_max_file_bytes(exact()) < UINT64_MAX, "limits: the runtime limits bound the file size");
         check(session_read_max_file_bytes(SessionReadLimits{}) == UINT64_MAX, "limits: open limits leave it open");
+        {
+            auto open = exact(); open.max_drafter_bytes = UINT64_MAX;
+            check(session_read_max_file_bytes(open) == UINT64_MAX, "limits: an open drafter window leaves it open");
+            auto with = exact(); with.max_drafter_bytes = 1u << 20;
+            check(session_read_max_file_bytes(with) >= session_read_max_file_bytes(exact()) + 3 * (1u << 20),
+                  "limits: the drafter window of the live state and each checkpoint enters the file bound");
+        }
         auto l = exact(); l.max_state_bytes[0] = 4098;
         check(rejects(good, id, "limit", l), "limits: a GDN state over the runtime size refused");
         l = exact(); l.max_state_bytes[4] = 7;

@@ -188,6 +188,7 @@ inline ConversationCheckpoint copy_checkpoint_beating(const ConversationCheckpoi
     o.tails = copy_beating(c.tails);
     o.dead = copy_beating(c.dead);
     o.block_pos = copy_beating(c.block_pos);
+    o.drafter = copy_beating(c.drafter);
     o.used = c.used;
     o.pinned = c.pinned;
     o.stage_parts.reserve(c.stage_parts.size());
@@ -219,6 +220,7 @@ inline void copy_checkpoint_into(ConversationCheckpoint& o, const ConversationCh
     assign_beating(o.tails, c.tails);
     assign_beating(o.dead, c.dead);
     assign_beating(o.block_pos, c.block_pos);
+    assign_beating(o.drafter, c.drafter);
     o.used = c.used;
     o.pinned = c.pinned;
     o.stage_parts.clear();

@@ -1367,11 +1367,14 @@ class StrataEngine:
             self.last.update(offloaded=int(f[15]))
         for tok in f[16:]:                                # key=value fields after the positional ones (the prompt's
             key, eq, value = tok.partition("=")           # first chunk and its streamed expert blobs)
-            if eq and key in ("chunk", "experts_streamed", "amd_tier"):   # amd_tier: --peer-device hip:N only
+            if eq and key in ("chunk", "experts_streamed", "amd_tier",   # amd_tier: --peer-device hip:N only
+                              "df2_windows_restored", "df2_windows_missing"):   # --draft dflash2 only, since start
                 try:
                     self.last[key] = int(value)
                 except ValueError:
-                    pass
+                    continue
+                if key.startswith("df2_windows_") and isinstance(getattr(self, "info", None), dict):
+                    self.info[key] = self.last[key]       # GET /metrics shows them under "engine"
 
     def vram(self, reserve_mib: int | None, timeout: float = 120.0) -> dict:
         """#533: `VRAM <reserve_mib>` between requests (the caller holds the service's FIFO): the engine shrinks its

@@ -25,6 +25,7 @@ struct ConversationCheckpoint {
     std::vector<int32_t> ids;
     std::vector<ConversationImageKey> imgs;
     std::vector<uint8_t> gdn, ple, tails, dead, block_pos;
+    std::vector<uint8_t> drafter;   // the DFlash2 drafter's saved window at ids.size(), empty when there is none
     uint64_t used = 0; // upstream root-pinned/LRU checkpoint retention
     // STRATA_CKPT_VRAM_SLOTS: the tag of the device copy of `gdn` (0: none).  Set by conversation_checkpoint_save, the
     // only writer of a checkpoint's GDN bytes besides a whole copy (which keeps them equal, so it keeps the tag).
@@ -50,7 +51,7 @@ struct ConversationCheckpoint {
     size_t bytes() const {
         size_t n = ids.capacity() * sizeof(int32_t) + imgs.capacity() * sizeof(ConversationImageKey) +
                gdn.capacity() + ple.capacity() + tails.capacity() + dead.capacity() + block_pos.capacity() +
-               stage_parts.capacity() * sizeof(ConversationCheckpoint);
+               drafter.capacity() + stage_parts.capacity() * sizeof(ConversationCheckpoint);
         for (const auto& part : stage_parts) n += part.bytes();
         return n;
     }

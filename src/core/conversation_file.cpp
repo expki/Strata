@@ -35,17 +35,17 @@
 #include <unistd.h>
 #endif
 
-// Format v1 stores integers and floats as this machine holds them in memory; it is defined as little-endian with
+// The format stores integers and floats as this machine holds them in memory; it is defined as little-endian with
 // IEEE-754 floats, so a build where that is not the memory layout is refused rather than writing another format.
-static_assert(std::endian::native == std::endian::little, "session files (format v1) are little-endian only");
+static_assert(std::endian::native == std::endian::little, "session files (format v2) are little-endian only");
 static_assert(std::numeric_limits<float>::is_iec559 && std::numeric_limits<double>::is_iec559,
-              "session files (format v1) need IEEE-754 floats");
+              "session files (format v2) need IEEE-754 floats");
 
 namespace strata::core {
 namespace {
 constexpr char kMagic[8] = {'S', 'T', 'R', 'S', 'E', 'S', 'S', '\x01'};
 constexpr char kEnd[8] = {'S', 'T', 'R', 'S', 'E', 'N', 'D', '\x01'};
-constexpr uint32_t kVersion = 1;
+constexpr uint32_t kVersion = 2;   // 2: every checkpoint carries a drafter window
 constexpr size_t kHeader = 64, kTrailer = 16;
 
 // Progress for a transfer: one report after every block that was handed to (or read from) the OS, whatever its size
@@ -683,6 +683,7 @@ void put_checkpoint(Out& o, const ConversationCheckpoint& c) {
     o.u64(c.imgs.size());
     for (const auto& k : c.imgs) { o.i64(k.start); o.u64(k.hash); }
     o.vec(c.gdn); o.vec(c.ple); o.vec(c.tails); o.vec(c.dead); o.vec(c.block_pos);
+    o.vec(c.drafter);
     o.u64(c.used);
 }
 
@@ -759,7 +760,7 @@ bool get_checkpoint(In& in, ConversationCheckpoint& c) {
     for (auto& k : c.imgs) if (!in.i64(k.start) || !in.u64(k.hash)) return false;
     const auto& m = in.limits.max_state_bytes;   // byte arrays: element and byte counts are the same
     return in.vec(c.gdn, m[0]) && in.vec(c.ple, m[1]) && in.vec(c.tails, m[2]) && in.vec(c.dead, m[3]) &&
-           in.vec(c.block_pos, m[4]) && in.u64(c.used);
+           in.vec(c.block_pos, m[4]) && in.vec(c.drafter, in.limits.max_drafter_bytes) && in.u64(c.used);
 }
 
 bool get_payload(In& in, SavedConversation& s) {
@@ -776,8 +777,8 @@ bool get_payload(In& in, SavedConversation& s) {
     s.cvec = cvec == 1;
     if (!get_checkpoint(in, s.live)) return false;
     uint64_t n = 0;
-    // a checkpoint is at least 8 counts + used = 72 bytes; a K/V layer at least 7 + 5 = 96
-    if (!in.count(n, 72, in.limits.max_checkpoints)) return false;
+    // a checkpoint is at least 9 counts + used = 80 bytes; a K/V layer at least 7 + 5 = 96
+    if (!in.count(n, 80, in.limits.max_checkpoints)) return false;
     s.checkpoints.resize((size_t) n);
     for (auto& c : s.checkpoints) if (!get_checkpoint(in, c)) return false;
     if (!in.count(n, 96, in.limits.max_kv_layers)) return false;
@@ -801,7 +802,7 @@ bool has_stage_parts(const SavedConversation& s) {
     return false;
 }
 
-// header v1, little-endian: magic[8] version:u32 header_size:u32 model:u64 config:u64 payload:u64 reserved:u64[2]
+// header v2, little-endian: magic[8] version:u32 header_size:u32 model:u64 config:u64 payload:u64 reserved:u64[2]
 // header_hash:u64 (session_hash64 of bytes 0..55, seed 0)
 void header_bytes(uint8_t* h, const SessionFileIdentity& id, uint64_t payload) {
     std::memset(h, 0, kHeader);
@@ -1001,10 +1002,12 @@ uint64_t session_read_max_file_bytes(const SessionReadLimits& l) {
     const uint64_t open = UINT64_MAX;
     if (l.max_tokens == open || l.max_checkpoints == open || l.max_kv_layers == open) return l.max_file_bytes;
     for (uint64_t b : l.max_state_bytes) if (b == open) return l.max_file_bytes;
+    if (l.max_drafter_bytes == open) return l.max_file_bytes;
     if (l.max_kv_bytes.size() < l.max_kv_layers) return l.max_file_bytes;
-    // one checkpoint: ids (8 + 4 per token), images (8 + 16 per image), five state arrays (8 + bytes), used (8)
+    // one checkpoint: ids (8 + 4 per token), images (8 + 16 per image), six byte arrays (8 + bytes), used (8)
     uint64_t cp = sat_add(16, sat_mul(l.max_tokens, 4 + 16));
     for (uint64_t b : l.max_state_bytes) cp = sat_add(cp, sat_add(8, b));
+    cp = sat_add(cp, sat_add(8, l.max_drafter_bytes));
     cp = sat_add(cp, 8);
     uint64_t n = kHeader + kTrailer + 18 * 8 + 3 * 8;             // geometry, layer range, cvec
     n = sat_add(n, cp);                                            // live
